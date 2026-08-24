@@ -1,8 +1,8 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { MutableRefObject, ReactNode } from 'react'
 import { createPortal, useFrame, useThree } from '@react-three/fiber'
-import { Line, Text } from '@react-three/drei'
-import { CatmullRomCurve3, Color, Euler, Group, Matrix4, Mesh, Quaternion, Vector3 } from 'three'
+import { Text } from '@react-three/drei'
+import { Euler, Group, Matrix4, Mesh, Quaternion, Vector3 } from 'three'
 import {
   Interactable,
   useInstanceEvent,
@@ -13,17 +13,19 @@ import { XRGrabProvider, useGrabbable } from 'xrift-grab'
 import type { Hand } from 'xrift-grab'
 import { desktopHandApprox, handToWorld, handWorldQuaternion } from './math'
 import { StrokeStore } from './store'
+import { pruneStrokeRenderCaches, StrokeRenderer } from './brushes'
 import {
+  DEFAULT_BRUSH,
+  DEFAULT_RIBBON_SIZE,
   DESKTOP_DRAW_DISTANCE,
   MAX_POINTS_PER_STROKE,
   MIN_SEGMENT,
   PEN_COLORS,
   RAINBOW,
   SEG_BATCH_POINTS,
-  SMOOTH_DIV,
   roundMm,
 } from './types'
-import type { EndEvent, SegEvent, Stroke, UndoEvent } from './types'
+import type { BrushId, EndEvent, SegEvent, Stroke, UndoEvent } from './types'
 
 /**
  * ペンラック — QvPen準拠の空間らくがきペン（アイテム版）。
@@ -99,6 +101,10 @@ export interface DcPenProps {
   rotationY?: number
   /** 同期キーの名前空間。1ワールド/1インスタンスに複数置くときは変えること */
   syncId?: string
+  /** 通常線/RibbonBrushの比較UIを表示する。既定falseで0.1.xの体験を維持 */
+  enableBrushControls?: boolean
+  defaultBrush?: BrushId
+  defaultRibbonSize?: number
   debugApi?: (api: DcPenDebugApi) => void
 }
 
@@ -130,112 +136,54 @@ function normHolder(v: unknown): HolderInfo | null {
   return null
 }
 
-/** フラット配列→drei Line用タプル列。未着バッチの穴はスキップ */
-function toTuples(pts: number[]): [number, number, number][] {
-  const out: [number, number, number][] = []
-  for (let i = 0; i + 2 < pts.length; i += 3) {
-    const x = pts[i]
-    const y = pts[i + 1]
-    const z = pts[i + 2]
-    if (x === undefined || y === undefined || z === undefined) continue
-    if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(z)) continue
-    out.push([x, y, z])
-  }
-  return out
-}
-
-const _rainbowC = new Color()
-/**
- * 虹の色相の進み（描画頂点1つあたり）。旧実装は15mm間隔の点ごとに0.02＝約1.33周/m。
- * 補間後の頂点間隔は MIN_SEGMENT/SMOOTH_DIV なので、同じ「周/m」になるよう換算する
- */
-const RAINBOW_HUE_STEP = 0.02 * (MIN_SEGMENT / 0.015 / SMOOTH_DIV)
-/**
- * 虹ペンの線: 点列に沿って色相が巡る頂点色。
- * indexOffsetは部分消しで分割されたストロークが「切られる前の続き」の色相から
- * 始まるための位相合わせ（元のストロークの hueOffset を SMOOTH_DIV 換算した値）
- */
-function rainbowVertexColors(n: number, indexOffset: number): [number, number, number][] {
-  const out: [number, number, number][] = []
-  for (let i = 0; i < n; i++) {
-    _rainbowC.setHSL(((i + indexOffset) * RAINBOW_HUE_STEP) % 1, 1, 0.6)
-    out.push([_rainbowC.r, _rainbowC.g, _rainbowC.b])
-  }
-  return out
-}
-
-/** 虹の頂点色キャッシュ。毎レンダーで新配列を渡すとdrei Lineがジオメトリを作り直してしまうため */
-const rainbowColorsCache = new Map<string, { n: number; off: number; colors: [number, number, number][] }>()
-function rainbowColorsCached(key: string, n: number, off: number): [number, number, number][] {
-  const hit = rainbowColorsCache.get(key)
-  if (hit && hit.n === n && hit.off === off) return hit.colors
-  const colors = rainbowVertexColors(n, off)
-  rainbowColorsCache.set(key, { n, off, colors })
-  return colors
-}
-
-/**
- * 描画専用の平滑化＝同期点列(MIN_SEGMENT間隔)をCatmull-Romで通過補間して細分する。
- * 同期・保存・消しゴム判定はすべて元の点列のまま＝見た目だけ滑らか（帯域ゼロ増）。
- * centripetal型は不等間隔の手書き点でループ/オーバーシュートを起こさない定番。
- * キャッシュは点数が変わったときだけ再計算（描画中ストロークは伸びるたび、完了線は1回きり）
- */
-const _smoothCache = new Map<string, { n: number; pts: [number, number, number][] }>()
-function smoothPoints(key: string, raw: [number, number, number][]): [number, number, number][] {
-  if (raw.length < 3) return raw
-  const hit = _smoothCache.get(key)
-  if (hit && hit.n === raw.length) return hit.pts
-  const curve = new CatmullRomCurve3(
-    raw.map((p) => new Vector3(p[0], p[1], p[2])),
-    false,
-    'centripetal',
-  )
-  const pts = curve
-    .getPoints((raw.length - 1) * SMOOTH_DIV)
-    .map((v) => [v.x, v.y, v.z] as [number, number, number])
-  _smoothCache.set(key, { n: raw.length, pts })
-  return pts
-}
-/** 消えたストロークのキャッシュを間引く（合計線数の2倍を超えたら現存分だけ残す） */
-function pruneStrokeCaches(liveKeys: Set<string>) {
-  if (_smoothCache.size > liveKeys.size * 2 + 16) {
-    for (const k of _smoothCache.keys()) if (!liveKeys.has(k)) _smoothCache.delete(k)
-  }
-  if (rainbowColorsCache.size > liveKeys.size * 2 + 16) {
-    for (const k of rainbowColorsCache.keys()) if (!liveKeys.has(k)) rainbowColorsCache.delete(k)
-  }
-}
-
-/**
- * ストローク1本の描画。storeはptsをin-place変異させるため、伸びはcount（点数）で
- * 検知する。memoにより無関係な再レンダー（他人のseg受信ごとのbump等）では
- * toTuples・スプライン再計算・ジオメトリ再構築を一切走らせない
- */
-const StrokeLine = memo(
-  ({ cacheKey, stroke }: { cacheKey: string; stroke: Stroke; count: number }) => {
-    const raw = toTuples(stroke.pts)
-    if (raw.length < 2) return null
-    const pts = smoothPoints(cacheKey, raw)
-    if (stroke.color === RAINBOW) {
-      return (
-        <Line
-          points={pts}
-          vertexColors={rainbowColorsCached(cacheKey, pts.length, (stroke.hueOffset ?? 0) * SMOOTH_DIV)}
-          color="#ffffff"
-          lineWidth={4}
-        />
-      )
-    }
-    return <Line points={pts} color={stroke.color} lineWidth={4} />
-  },
-)
-
 interface ActiveStroke {
   sid: string
   color: string
   count: number
   sent: number
   hueOffset: number
+  brushId: BrushId
+  size: number
+  startedAt: number
+  lastSampleAt: number
+}
+
+function roundedQuaternion(quaternion: Quaternion): number[] {
+  return [quaternion.x, quaternion.y, quaternion.z, quaternion.w].map(
+    (value) => Math.round(value * 1000) / 1000,
+  )
+}
+
+/** XR Gamepadのアナログトリガーを優先し、取得できない場合は移動速度から疑似筆圧を作る。 */
+export function resolvePressure(source: XRInputSource | null, distance: number, deltaSeconds: number): number {
+  const raw = source?.gamepad?.buttons[0]?.value
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return Math.round(Math.max(0.08, Math.min(1, raw)) * 1000) / 1000
+  }
+  if (distance <= 0 || deltaSeconds <= 0) return 0.7
+  const speed = distance / deltaSeconds
+  return Math.round(Math.max(0.2, Math.min(1, 1 - speed * 0.45)) * 1000) / 1000
+}
+
+function sliceStrokeMeta(stroke: Stroke, start: number, end: number) {
+  return {
+    brushId: stroke.brushId,
+    size: stroke.size,
+    orientations: stroke.orientations?.slice(start * 4, end * 4),
+    pressures: stroke.pressures?.slice(start, end),
+    timestamps: stroke.timestamps?.slice(start, end),
+  }
+}
+
+function segmentEvent(stroke: Stroke, start: number, end: number): SegEvent {
+  return {
+    sid: stroke.sid,
+    color: stroke.color,
+    off: start,
+    pts: stroke.pts.slice(start * 3, end * 3),
+    hueOffset: stroke.hueOffset,
+    ...sliceStrokeMeta(stroke, start, end),
+  }
 }
 
 /** 空中に置かれたペンの姿勢（instance stateで同期） */
@@ -245,7 +193,12 @@ interface PenPose {
 }
 
 /** ラック全体で共有する描画入力の状態（手ごと。子スロットは持ち手の分だけ読む） */
-type DrawInput = Record<Hand, { down: boolean; seq: number }>
+type DrawInput = Record<Hand, { down: boolean; seq: number; source: XRInputSource | null }>
+
+interface BrushSettings {
+  id: BrushId
+  size: number
+}
 
 /** 消しゴムモードは手ごとに独立（両手持ち時に片方だけ消しゴムにできる） */
 type EraserModes = Record<Hand, boolean>
@@ -264,7 +217,15 @@ const HANG_Q = new Quaternion().setFromEuler(new Euler(-Math.PI / 2, 0, 0))
 const PEN_COUNT = PEN_COLORS.length
 const SLOT_COUNT = PEN_COUNT + ERASER_COLORS.length
 
-export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', debugApi }: DcPenProps) => {
+export const DcPen = ({
+  position = [0, 0, 0],
+  rotationY = 0,
+  syncId = 'dcpen',
+  enableBrushControls = false,
+  defaultBrush = DEFAULT_BRUSH,
+  defaultRibbonSize = DEFAULT_RIBBON_SIZE,
+  debugApi,
+}: DcPenProps) => {
   const SYNC_ID = syncId
   const scene = useThree((s) => s.scene)
   const gl = useThree((s) => s.gl)
@@ -275,6 +236,10 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
   const store = storeRef.current
   const [, setTick] = useState(0)
   const bump = useCallback(() => setTick((n) => n + 1), [])
+  const [brushId, setBrushId] = useState<BrushId>(enableBrushControls ? defaultBrush : 'line')
+  const [brushSize, setBrushSize] = useState(() => Math.max(0.012, Math.min(0.08, defaultRibbonSize)))
+  const brushSettings = useRef<BrushSettings>({ id: brushId, size: brushSize })
+  brushSettings.current = { id: brushId, size: brushSize }
 
   const [persisted, setPersisted] = useInstanceState<Stroke[]>(`${SYNC_ID}:strokes`, [])
   useEffect(() => {
@@ -285,7 +250,7 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
   }, [persisted, store, bump])
 
   const emitSeg = useInstanceEvent<SegEvent>(`${SYNC_ID}:seg`, (d) => {
-    store.applySegment(d.sid, d.color, d.off, d.pts, d.hueOffset)
+    store.applySegment(d.sid, d.color, d.off, d.pts, d.hueOffset, d)
     bump()
   })
   const emitEnd = useInstanceEvent<EndEvent>(`${SYNC_ID}:end`, (d) => {
@@ -395,8 +360,8 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
   // ---- 入力（手ごとに1系統。どのスロットが反応するかは各スロットが判断） ----
   // 注意: キーボードは使えない（プレイヤー移動系がwindowのkeydown/keyupを独占）
   const drawInput = useRef<DrawInput>({
-    left: { down: false, seq: 0 },
-    right: { down: false, seq: 0 },
+    left: { down: false, seq: 0, source: null },
+    right: { down: false, seq: 0, source: null },
   })
   /** QvPen準拠: 持ち手トリガーのダブルクリック(0.2s)で消しゴムモード切替（手ごと） */
   const eraserMode = useRef<EraserModes>({ left: false, right: false })
@@ -407,7 +372,7 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
   const putAwayFns = useRef<((() => void) | null)[]>(new Array(SLOT_COUNT).fill(null))
 
   useEffect(() => {
-    const press = (hand: Hand) => {
+    const press = (hand: Hand, source: XRInputSource | null = null) => {
       const now = performance.now()
       if (anyHeldByHand.current[hand] && now - lastPressAt.current[hand] < DOUBLE_CLICK_MS) {
         eraserMode.current[hand] = !eraserMode.current[hand]
@@ -415,9 +380,11 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
       lastPressAt.current[hand] = now
       drawInput.current[hand].down = true
       drawInput.current[hand].seq += 1
+      drawInput.current[hand].source = source
     }
     const release = (hand: Hand) => {
       drawInput.current[hand].down = false
+      drawInput.current[hand].source = null
     }
 
     // デスクトップのマウスは右手扱い
@@ -435,7 +402,7 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
 
     const onSelectStart = (e: XRInputSourceEvent) => {
       const h = handOf(e)
-      if (h) press(h)
+      if (h) press(h, e.inputSource)
     }
     const onSelectEnd = (e: XRInputSourceEvent) => {
       const h = handOf(e)
@@ -457,6 +424,8 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
       boundSession = null
       drawInput.current.left.down = false
       drawInput.current.right.down = false
+      drawInput.current.left.source = null
+      drawInput.current.right.source = null
     }
     gl.xr.addEventListener('sessionstart', bindSession)
     gl.xr.addEventListener('sessionend', unbindSession)
@@ -477,7 +446,7 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
 
   // ---- レイアウト（QvPenのラック風・机なし空中固定） ----
   const strokes = store.all()
-  pruneStrokeCaches(new Set(strokes.map((s) => `${SYNC_ID}|${s.sid}`)))
+  pruneStrokeRenderCaches(new Set(strokes.map((s) => `${SYNC_ID}|${s.sid}`)))
   const penX = (i: number) => (i - (PEN_COUNT - 1) / 2) * 0.17
   const eraserX = (i: number) => penX(PEN_COUNT - 1) + 0.32 + i * 0.13
 
@@ -508,6 +477,7 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
             eraserMode={eraserMode}
             eraseStroke={eraseStroke}
             putAwayFns={putAwayFns}
+            brushSettings={brushSettings}
           />
         ))}
 
@@ -532,6 +502,7 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
             eraserMode={eraserMode}
             eraseStroke={eraseStroke}
             putAwayFns={putAwayFns}
+            brushSettings={brushSettings}
           />
         ))}
 
@@ -598,13 +569,63 @@ export const DcPen = ({ position = [0, 0, 0], rotationY = 0, syncId = 'dcpen', d
           interactionText="ペンと消しゴムをぜんぶ片づける"
           onInteract={putAwayAll}
         />
+        {enableBrushControls ? (
+          <group>
+            <Text position={[0.15, 1.92, 0.01]} fontSize={0.05} color="#172033" anchorX="center">
+              BRUSH LAB
+            </Text>
+            <LabeledButton
+              id={`${SYNC_ID}-brush-line`}
+              position={[-0.34, 1.78, 0]}
+              size={[0.3, 0.12, 0.035]}
+              color={brushId === 'line' ? '#0f766e' : '#475569'}
+              label="LINE"
+              fontSize={0.035}
+              interactionText="通常のDcPen線に切り替える"
+              onInteract={() => setBrushId('line')}
+            />
+            <LabeledButton
+              id={`${SYNC_ID}-brush-ribbon`}
+              position={[0.02, 1.78, 0]}
+              size={[0.36, 0.12, 0.035]}
+              color={brushId === 'ribbon' ? '#c2410c' : '#475569'}
+              label="RIBBON"
+              fontSize={0.032}
+              interactionText="筆圧リボン筆に切り替える"
+              onInteract={() => setBrushId('ribbon')}
+            />
+            <LabeledButton
+              id={`${SYNC_ID}-brush-thinner`}
+              position={[0.35, 1.78, 0]}
+              size={[0.2, 0.12, 0.035]}
+              color="#334155"
+              label="THIN"
+              fontSize={0.027}
+              interactionText="リボン筆を細くする"
+              onInteract={() => setBrushSize((size) => Math.max(0.012, Math.round((size - 0.006) * 1000) / 1000))}
+            />
+            <LabeledButton
+              id={`${SYNC_ID}-brush-wider`}
+              position={[0.6, 1.78, 0]}
+              size={[0.2, 0.12, 0.035]}
+              color="#334155"
+              label="WIDE"
+              fontSize={0.027}
+              interactionText="リボン筆を太くする"
+              onInteract={() => setBrushSize((size) => Math.min(0.08, Math.round((size + 0.006) * 1000) / 1000))}
+            />
+            <Text position={[0.84, 1.78, 0.02]} fontSize={0.032} color="#172033" anchorX="left">
+              {`${Math.round(brushSize * 1000)}mm`}
+            </Text>
+          </group>
+        ) : null}
       </XRGrabProvider>
 
       {/* ストロークはワールド座標なのでシーン直下に描く（描画時のみスプライン細分） */}
       {createPortal(
         <group>
           {strokes.map((s) => (
-            <StrokeLine key={s.sid} cacheKey={`${SYNC_ID}|${s.sid}`} stroke={s} count={s.pts.length} />
+            <StrokeRenderer key={s.sid} cacheKey={`${SYNC_ID}|${s.sid}`} stroke={s} count={s.pts.length} />
           ))}
         </group>,
         scene,
@@ -633,6 +654,7 @@ interface PenSlotProps {
   eraserMode: MutableRefObject<EraserModes>
   eraseStroke: (sid: string) => void
   putAwayFns: MutableRefObject<((() => void) | null)[]>
+  brushSettings: MutableRefObject<BrushSettings>
 }
 
 /** ラックの1本＝独立した持ち主を持つペン/消しゴム */
@@ -654,6 +676,7 @@ const PenSlot = ({
   eraserMode,
   eraseStroke,
   putAwayFns,
+  brushSettings,
 }: PenSlotProps) => {
   const SYNC_ID = syncId
   const { localUser, getMovement, getLocalMovement, getAvatarHeight } = useUsers()
@@ -710,7 +733,7 @@ const PenSlot = ({
       return
     }
     if (a.sent < a.count) {
-      emitSeg({ sid: a.sid, color: a.color, off: a.sent, pts: s.pts.slice(a.sent * 3, a.count * 3), hueOffset: a.hueOffset })
+      emitSeg(segmentEvent(s, a.sent, a.count))
     }
     emitEnd({ sid: a.sid })
     store.markFinished(a.sid)
@@ -877,9 +900,11 @@ const PenSlot = ({
         seqRef.current += 1
         const sid = `${myIdRef.current}:${index}:${Date.now().toString(36)}:${seqRef.current}`
         const hueOffset = baseHue + run.start
-        store.applySegment(sid, s.color, 0, run.pts, hueOffset)
+        const pointCount = run.pts.length / 3
+        const meta = sliceStrokeMeta(s, run.start, run.start + pointCount)
+        store.applySegment(sid, s.color, 0, run.pts, hueOffset, meta)
         store.markFinished(sid)
-        emitSeg({ sid, color: s.color, off: 0, pts: run.pts, hueOffset })
+        emitSeg({ sid, color: s.color, off: 0, pts: run.pts, hueOffset, ...meta })
         emitEnd({ sid })
       }
       persistFinished()
@@ -902,7 +927,7 @@ const PenSlot = ({
     let hasPose = false
     _penPos.copy(tip.current)
     if (h.id === myIdRef.current) {
-      if (grab.getAttachedPose(_penPos, _tipQ)) {
+        if (grab.getAttachedPose(_penPos, _tipQ)) {
         // 自分のVRの手はxrift-grabがXRFrameのgrip姿勢から直接求める。
         // 掴んだ瞬間の相対姿勢が掛かった状態で返るので「持った向きのまま」手に追従する
         tip.current.copy(_penPos)
@@ -913,7 +938,7 @@ const PenSlot = ({
         if (mv.isInVR && mv.vrTracking) {
           hasPose = handToWorld(mv, h.hand, tip.current)
           _penPos.copy(tip.current)
-          if (held && handWorldQuaternion(mv, h.hand, _tipQ)) held.quaternion.copy(_tipQ)
+          if (handWorldQuaternion(mv, h.hand, _tipQ) && held) held.quaternion.copy(_tipQ)
         } else {
           // デスクトップ: インクは照準先、持ち物はFPSの構え
           camera.getWorldPosition(_camPos)
@@ -924,6 +949,7 @@ const PenSlot = ({
           if (held) {
             _lookM.lookAt(_penPos, tip.current, camera.up)
             held.quaternion.setFromRotationMatrix(_lookM)
+            _tipQ.copy(held.quaternion)
           }
           hasPose = true
         }
@@ -992,20 +1018,34 @@ const PenSlot = ({
         }
         if (tip.current.distanceTo(pressAnchor.current) < MIN_SEGMENT * 1.5) return
         seqRef.current += 1
+        const startedAt = Math.round(clock.elapsedTime * 1000)
+        const settings = brushSettings.current
         a = {
           sid: `${myIdRef.current}:${index}:${Date.now().toString(36)}:${seqRef.current}`,
           color,
           count: 0,
           sent: 0,
           hueOffset: nextHueOffset.current,
+          brushId: settings.id,
+          size: settings.size,
+          startedAt,
+          lastSampleAt: startedAt,
         }
         activeRef.current = a
+        const firstPressure = resolvePressure(input.source, 0, 0)
         store.applySegment(
           a.sid,
           a.color,
           0,
           [roundMm(pressAnchor.current.x), roundMm(pressAnchor.current.y), roundMm(pressAnchor.current.z)],
           a.hueOffset,
+          {
+            brushId: a.brushId,
+            size: a.size,
+            orientations: roundedQuaternion(_tipQ),
+            pressures: [firstPressure],
+            timestamps: [0],
+          },
         )
         a.count = 1
         nextHueOffset.current += 1
@@ -1015,19 +1055,32 @@ const PenSlot = ({
         endActiveStroke()
         return
       }
-      if (tip.current.distanceTo(lastPt.current) < MIN_SEGMENT) return
+      const distance = tip.current.distanceTo(lastPt.current)
+      if (distance < MIN_SEGMENT) return
+      const sampledAt = Math.round(clock.elapsedTime * 1000)
+      const pressure = resolvePressure(input.source, distance, (sampledAt - a.lastSampleAt) / 1000)
       lastPt.current.copy(tip.current)
-      store.applySegment(a.sid, a.color, a.count, [
-        roundMm(tip.current.x),
-        roundMm(tip.current.y),
-        roundMm(tip.current.z),
-      ])
+      store.applySegment(
+        a.sid,
+        a.color,
+        a.count,
+        [roundMm(tip.current.x), roundMm(tip.current.y), roundMm(tip.current.z)],
+        a.hueOffset,
+        {
+          brushId: a.brushId,
+          size: a.size,
+          orientations: roundedQuaternion(_tipQ),
+          pressures: [pressure],
+          timestamps: [sampledAt - a.startedAt],
+        },
+      )
       a.count += 1
+      a.lastSampleAt = sampledAt
       nextHueOffset.current += 1
       if (a.count - a.sent >= SEG_BATCH_POINTS) {
         const s = store.get(a.sid)
         if (s) {
-          emitSeg({ sid: a.sid, color: a.color, off: a.sent, pts: s.pts.slice(a.sent * 3, a.count * 3), hueOffset: a.hueOffset })
+          emitSeg(segmentEvent(s, a.sent, a.count))
           a.sent = a.count
         }
       }

@@ -1,5 +1,5 @@
 import { MAX_TOTAL_POINTS, roundMm } from './types'
-import type { Stroke } from './types'
+import type { SegEvent, Stroke } from './types'
 
 /**
  * インスタンス内の全ストロークを保持するストア。
@@ -28,17 +28,39 @@ export class StrokeStore {
       .filter((s): s is Stroke => s !== undefined)
   }
 
-  /** 増分書き込み（自エコー・重複到着に冪等）。hueOffsetは新規ストローク作成時のみ効く */
-  applySegment(sid: string, color: string, off: number, pts: number[], hueOffset = 0): void {
+  /** 増分書き込み（自エコー・重複到着に冪等）。旧lineイベントも受理する */
+  applySegment(
+    sid: string,
+    color: string,
+    off: number,
+    pts: number[],
+    hueOffset = 0,
+    meta: Pick<SegEvent, 'brushId' | 'size' | 'orientations' | 'pressures' | 'timestamps'> = {},
+  ): void {
     let s = this.strokes.get(sid)
     if (!s) {
-      s = { sid, color, pts: [], hueOffset }
+      s = {
+        sid,
+        color,
+        pts: [],
+        hueOffset,
+        brushId: meta.brushId,
+        size: meta.size,
+        orientations: meta.orientations ? [] : undefined,
+        pressures: meta.pressures ? [] : undefined,
+        timestamps: meta.timestamps ? [] : undefined,
+      }
       this.strokes.set(sid, s)
     }
+    if (meta.brushId !== undefined) s.brushId = meta.brushId
+    if (meta.size !== undefined) s.size = meta.size
     const base = off * 3
     for (let i = 0; i < pts.length; i++) {
       s.pts[base + i] = pts[i]
     }
+    writeSegment(s, 'orientations', off * 4, meta.orientations)
+    writeSegment(s, 'pressures', off, meta.pressures)
+    writeSegment(s, 'timestamps', off, meta.timestamps)
     this.version++
   }
 
@@ -56,7 +78,17 @@ export class StrokeStore {
     let changed = false
     for (const s of strokes) {
       if (this.strokes.has(s.sid)) continue
-      this.strokes.set(s.sid, { sid: s.sid, color: s.color, pts: [...s.pts], hueOffset: s.hueOffset ?? 0 })
+      this.strokes.set(s.sid, {
+        sid: s.sid,
+        color: s.color,
+        pts: [...s.pts],
+        hueOffset: s.hueOffset ?? 0,
+        brushId: s.brushId,
+        size: s.size,
+        orientations: s.orientations ? [...s.orientations] : undefined,
+        pressures: s.pressures ? [...s.pressures] : undefined,
+        timestamps: s.timestamps ? [...s.timestamps] : undefined,
+      })
       this.finished.add(s.sid)
       this.finishedOrder.push(s.sid)
       changed = true
@@ -93,6 +125,18 @@ export class StrokeStore {
       this.remove(oldest)
     }
   }
+}
+
+function writeSegment(
+  stroke: Stroke,
+  key: 'orientations' | 'pressures' | 'timestamps',
+  offset: number,
+  values: number[] | undefined,
+): void {
+  if (!values) return
+  const target = stroke[key] ?? []
+  for (let index = 0; index < values.length; index += 1) target[offset + index] = values[index]
+  stroke[key] = target
 }
 
 /** Vector3的な点をmm丸めでフラット配列に積む */

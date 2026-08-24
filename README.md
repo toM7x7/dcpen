@@ -4,6 +4,9 @@
 
 *A QvPen-style spatial drawing pen for XRift worlds & items.*
 
+> このForkは原作者 [toming](https://github.com/tomingtoming/dcpen) さんのMIT版を土台に、
+> 「お絵描き保存ワールド」で線と平筆を比較するための実験版です。既定の描画は従来どおりLINEです。
+
 ![DcPen](public/thumbnail.png)
 
 ## できること
@@ -16,6 +19,8 @@
 - 線・持ち主・浮遊位置はインスタンス内で**全員に同期**。late joiner にも復元
 - **デスクトップ**: クリックで持つ／戻す・左ボタン長押しで描く
 - 描いた線はインスタンスが生きている限り残る＝**書き置き**ができる
+- `enableBrushControls` で **LINE / RIBBON** を切替。RIBBONはコントローラー姿勢とトリガー筆圧を帯メッシュへ反映
+- 筆圧を取得できない環境では描画速度から幅を補完。ブラシ情報も同期・late join復元に含む
 
 ## ワールドに置く
 
@@ -30,6 +35,7 @@ export const World = () => (
   <>
     {/* 任意の位置・向きに置ける。複数置くなら syncId を変える */}
     <DcPen position={[0, 0, -3]} rotationY={Math.PI / 4} />
+    <DcPen position={[3, 0, -3]} enableBrushControls defaultBrush="ribbon" />
   </>
 )
 ```
@@ -39,6 +45,9 @@ export const World = () => (
 | `position` | `[0, 0, 0]` | 設置位置（ラックの足元） |
 | `rotationY` | `0` | Y回転。ラック正面は +Z |
 | `syncId` | `'dcpen'` | 同期キーの名前空間。複数設置時は一意にする |
+| `enableBrushControls` | `false` | LINE/RIBBONと太さ比較UIを表示 |
+| `defaultBrush` | `'line'` | 初期ブラシ（`line` / `ribbon`） |
+| `defaultRibbonSize` | `0.035` | RIBBONの基準幅（m） |
 
 依存（`react` / `three` / `@react-three/fiber` / `@react-three/drei` / `@react-three/rapier` / `@xrift/world-components`）はすべて peerDependencies です。XRift ワールドプロジェクトなら追加インストールは不要です。
 
@@ -62,6 +71,7 @@ npm install
 npm run dev        # devプレビュー (https, ?preview で設置プレビュー確認)
 npm run build      # XRiftアイテムのビルド (Module Federation)
 npm run build:lib  # npmライブラリのビルド (lib/)
+npm test           # ブラシ形状と旧イベント互換のテスト
 ```
 
 ## License

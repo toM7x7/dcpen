@@ -7,5 +7,7 @@
  */
 export { DcPen } from './pen/DcPen'
 export type { DcPenProps, DcPenDebugApi } from './pen/DcPen'
-export { PEN_COLORS, RAINBOW } from './pen/types'
-export type { Stroke } from './pen/types'
+export { BRUSH_REGISTRY, StrokeRenderer, buildRibbonGeometry } from './pen/brushes'
+export { DEFAULT_BRUSH, DEFAULT_RIBBON_SIZE, PEN_COLORS, RAINBOW } from './pen/types'
+export type { BrushDefinition, RibbonGeometryData } from './pen/brushes'
+export type { BrushId, Stroke, StrokePoint } from './pen/types'

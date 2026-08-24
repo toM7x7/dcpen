@@ -1,7 +1,7 @@
 {
   "name": "xrift-dcpen",
-  "version": "0.1.4",
-  "description": "QvPen-style spatial drawing pen for XRift worlds & items — 空間らくがきペン",
+  "version": "0.2.0-brush-poc.1",
+  "description": "DcPen brush experiment for XRift — line-compatible spatial drawing with pressure ribbon brush",
   "type": "module",
   "main": "./lib/index.js",
   "module": "./lib/index.js",
@@ -21,8 +21,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build:lib": "vite build --config vite.lib.config.ts"
+    "build:lib": "vite build --config vite.lib.config.ts",
+    "prepare": "npm run build:lib"
   },
   "peerDependencies": {
     "@react-three/drei": ">=10.0.0",
@@ -50,7 +52,8 @@
     "three": "^0.183.1",
     "typescript": "^5.6.2",
     "vite": "^7.3.1",
-    "vite-plugin-dts": "^4.0.0"
+    "vite-plugin-dts": "^4.0.0",
+    "vitest": "^4.1.10"
   },
   "publishConfig": {
     "access": "public"
@@ -61,15 +64,19 @@
   },
   "license": "MIT",
   "author": "toming (https://toming.app)",
+  "contributors": [
+    "toM7x7 (brush experiment fork)"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tomingtoming/dcpen.git"
+    "url": "git+https://github.com/toM7x7/dcpen.git"
   },
   "keywords": [
     "xrift",
     "qvpen",
     "pen",
     "drawing",
+    "brush",
     "vr",
     "webxr",
     "react-three-fiber",
