@@ -12,7 +12,8 @@ export interface BrushDefinition {
 
 export const BRUSH_REGISTRY: readonly BrushDefinition[] = [
   { id: 'line', label: 'LINE', description: 'DcPen互換の均一な線' },
-  { id: 'ribbon', label: 'RIBBON', description: '向きと筆圧で幅が変わる平筆' },
+  { id: 'ribbon', label: 'RIBBON', description: '向きと描画速度で幅が変わる平筆' },
+  { id: 'calligraphy', label: 'FUDE', description: '速度と筆先方向で強弱・入り抜きを作る筆' },
 ]
 
 const RAINBOW_HUE_STEP = 0.02 * (MIN_SEGMENT / 0.015 / SMOOTH_DIV)
@@ -68,6 +69,22 @@ export interface RibbonGeometryData {
   indices: Uint32Array
 }
 
+export function getBrushWidthScale(
+  brushId: BrushId,
+  pressure: number,
+  pointIndex: number,
+  pointCount: number,
+): number {
+  const speedWidth = Math.max(0, Math.min(1, pressure))
+  if (brushId !== 'calligraphy') return 0.18 + speedWidth * 1.27
+
+  // 筆らしい入り・抜き。描画中も末尾が細くなり、確定時に自然な払いとして残る。
+  const entryTaper = Math.min(1, (pointIndex + 1) / 4)
+  const exitTaper = Math.min(1, Math.max(1, pointCount - pointIndex) / 5)
+  const taper = Math.max(0.06, Math.min(entryTaper, exitTaper))
+  return (0.08 + speedWidth * 1.62) * taper
+}
+
 /** Controller orientationのlocal Xを平筆の横方向として帯メッシュを作る。 */
 export function buildRibbonGeometry(stroke: Stroke): RibbonGeometryData | null {
   const points = toTuples(stroke.pts)
@@ -84,22 +101,32 @@ export function buildRibbonGeometry(stroke: Stroke): RibbonGeometryData | null {
 
   for (let index = 0; index < points.length; index += 1) {
     const point = new Vector3(...points[index])
+    const previous = points[Math.max(0, index - 1)]
+    const next = points[Math.min(points.length - 1, index + 1)]
+    tangent.set(next[0] - previous[0], next[1] - previous[1], next[2] - previous[2]).normalize()
     const qOffset = index * 4
     const q = stroke.orientations
     if (q && qOffset + 3 < q.length && q.slice(qOffset, qOffset + 4).every(Number.isFinite)) {
       quaternion.set(q[qOffset], q[qOffset + 1], q[qOffset + 2], q[qOffset + 3]).normalize()
       side.set(1, 0, 0).applyQuaternion(quaternion)
+      side.addScaledVector(tangent, -side.dot(tangent))
+      // local Xが軌跡と平行ならlocal Yへ逃がし、帯がゼロ幅に潰れるのを防ぐ。
+      if (side.lengthSq() < 1e-5) {
+        side.set(0, 1, 0).applyQuaternion(quaternion)
+        side.addScaledVector(tangent, -side.dot(tangent))
+      }
     } else {
-      const previous = points[Math.max(0, index - 1)]
-      const next = points[Math.min(points.length - 1, index + 1)]
-      tangent.set(next[0] - previous[0], next[1] - previous[1], next[2] - previous[2]).normalize()
-      side.crossVectors(tangent, up)
-      if (side.lengthSq() < 1e-5) side.set(1, 0, 0)
+      side.copy(up).addScaledVector(tangent, -up.dot(tangent))
     }
+    if (side.lengthSq() < 1e-5) side.set(1, 0, 0)
     side.normalize()
     const pressure = Math.max(0, Math.min(1, stroke.pressures?.[index] ?? 0.7))
-    // 実機で差を読み取りやすいよう、実験版は弱筆圧15%〜強筆圧140%まで誇張する。
-    const halfWidth = width * (0.15 + pressure * 1.25) * 0.5
+    const halfWidth = width * getBrushWidthScale(
+      stroke.brushId ?? DEFAULT_BRUSH,
+      pressure,
+      index,
+      points.length,
+    ) * 0.5
     const left = point.clone().addScaledVector(side, -halfWidth)
     const right = point.clone().addScaledVector(side, halfWidth)
     positions.set([left.x, left.y, left.z, right.x, right.y, right.z], index * 6)
@@ -160,7 +187,8 @@ function RibbonStroke({ stroke, count }: { stroke: Stroke; count: number }) {
 export const StrokeRenderer = memo(
   ({ cacheKey, stroke, count = stroke.pts.length }: { cacheKey?: string; stroke: Stroke; count?: number }) => {
     const key = cacheKey ?? stroke.sid
-    return (stroke.brushId ?? DEFAULT_BRUSH) === 'ribbon'
+    const brushId = stroke.brushId ?? DEFAULT_BRUSH
+    return brushId === 'ribbon' || brushId === 'calligraphy'
       ? <RibbonStroke stroke={stroke} count={count} />
       : <LineStroke cacheKey={key} stroke={stroke} />
   },

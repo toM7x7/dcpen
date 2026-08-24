@@ -2,7 +2,8 @@
  * ペンのストローク＝色付き折れ線1本。
  * pts は [x0, y0, z0, x1, y1, z1, ...] のフラット配列（ワールド座標・メートル）
  */
-export type BrushId = 'line' | 'ribbon'
+export type BrushId = 'line' | 'ribbon' | 'calligraphy'
+export type PenToolMode = BrushId | 'eraser'
 
 /** ブラシ実装へ渡す共通の1打点。通信時は帯域を抑えるため各要素をフラット配列で保持する。 */
 export interface StrokePoint {
@@ -24,7 +25,7 @@ export interface Stroke {
   hueOffset: number
   /** 省略された旧データは line として扱う */
   brushId?: BrushId
-  /** RibbonBrushの基準幅（メートル） */
+  /** Ribbon/Calligraphy Brushの基準幅（メートル） */
   size?: number
   /** 点ごとの姿勢 [x,y,z,w, ...] */
   orientations?: number[]
@@ -111,6 +112,20 @@ export const PEN_COLORS: readonly string[] = [
 /** 座標をmm精度に丸める（同期ペイロード削減） */
 export function roundMm(v: number): number {
   return Math.round(v * 1000) / 1000
+}
+
+/** 描画速度(m/s)をブラシ幅係数へ変換する。遅いほど1、速いほど0.18へ近づく。 */
+export function speedToWidthValue(speed: number): number {
+  if (!Number.isFinite(speed) || speed <= 0.08) return 1
+  const normalized = Math.max(0, Math.min(1, (speed - 0.08) / 1.12))
+  return Math.round((1 - normalized * 0.82) * 1000) / 1000
+}
+
+export function getNextPenToolMode(current: PenToolMode): PenToolMode {
+  if (current === 'line') return 'ribbon'
+  if (current === 'ribbon') return 'calligraphy'
+  if (current === 'calligraphy') return 'eraser'
+  return 'line'
 }
 
 export function getStrokePenIndex(stroke: Pick<Stroke, 'sid' | 'penIndex'>): number | null {

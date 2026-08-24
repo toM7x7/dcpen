@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildRibbonGeometry } from './brushes'
+import { buildRibbonGeometry, getBrushWidthScale } from './brushes'
 import { StrokeStore } from './store'
 import type { Stroke } from './types'
 
@@ -21,10 +21,24 @@ describe('RibbonBrush', () => {
     expect(geometry?.positions).toHaveLength(12)
     expect(geometry?.indices).toHaveLength(6)
 
-    const firstWidth = Math.abs((geometry?.positions[3] ?? 0) - (geometry?.positions[0] ?? 0))
-    const secondWidth = Math.abs((geometry?.positions[9] ?? 0) - (geometry?.positions[6] ?? 0))
-    expect(firstWidth).toBeCloseTo(0.006, 4)
-    expect(secondWidth).toBeCloseTo(0.056, 4)
+    const widthAt = (offset: number) => Math.hypot(
+      (geometry?.positions[offset + 3] ?? 0) - (geometry?.positions[offset] ?? 0),
+      (geometry?.positions[offset + 4] ?? 0) - (geometry?.positions[offset + 1] ?? 0),
+      (geometry?.positions[offset + 5] ?? 0) - (geometry?.positions[offset + 2] ?? 0),
+    )
+    const firstWidth = widthAt(0)
+    const secondWidth = widthAt(6)
+    expect(firstWidth).toBeCloseTo(0.0072, 4)
+    expect(secondWidth).toBeCloseTo(0.058, 4)
+  })
+
+  it('tapers a calligraphy stroke at both ends while retaining a broad middle', () => {
+    const scales = Array.from({ length: 9 }, (_, index) =>
+      getBrushWidthScale('calligraphy', 1, index, 9),
+    )
+    expect(scales[0]).toBeLessThan(scales[4])
+    expect(scales[8]).toBeLessThan(scales[4])
+    expect(scales[4]).toBeCloseTo(1.7, 4)
   })
 
   it('merges old line events and brush metadata without changing the old contract', () => {

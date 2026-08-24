@@ -2,7 +2,8 @@
  * ペンのストローク＝色付き折れ線1本。
  * pts は [x0, y0, z0, x1, y1, z1, ...] のフラット配列（ワールド座標・メートル）
  */
-export type BrushId = 'line' | 'ribbon';
+export type BrushId = 'line' | 'ribbon' | 'calligraphy';
+export type PenToolMode = BrushId | 'eraser';
 /** ブラシ実装へ渡す共通の1打点。通信時は帯域を抑えるため各要素をフラット配列で保持する。 */
 export interface StrokePoint {
     position: [number, number, number];
@@ -22,7 +23,7 @@ export interface Stroke {
     hueOffset: number;
     /** 省略された旧データは line として扱う */
     brushId?: BrushId;
-    /** RibbonBrushの基準幅（メートル） */
+    /** Ribbon/Calligraphy Brushの基準幅（メートル） */
     size?: number;
     /** 点ごとの姿勢 [x,y,z,w, ...] */
     orientations?: number[];
@@ -84,6 +85,9 @@ export declare const RAINBOW = "rainbow";
 export declare const PEN_COLORS: readonly string[];
 /** 座標をmm精度に丸める（同期ペイロード削減） */
 export declare function roundMm(v: number): number;
+/** 描画速度(m/s)をブラシ幅係数へ変換する。遅いほど1、速いほど0.18へ近づく。 */
+export declare function speedToWidthValue(speed: number): number;
+export declare function getNextPenToolMode(current: PenToolMode): PenToolMode;
 export declare function getStrokePenIndex(stroke: Pick<Stroke, 'sid' | 'penIndex'>): number | null;
 export declare function getStrokeOwnerId(stroke: Pick<Stroke, 'sid' | 'ownerUserId'>): string | null;
 //# sourceMappingURL=types.d.ts.map

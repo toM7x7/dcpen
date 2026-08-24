@@ -23,7 +23,7 @@ export interface DcPenProps {
     onSelectedPenChange?: (penIndex: number) => void;
     debugApi?: (api: DcPenDebugApi) => void;
 }
-/** XR Gamepadのアナログトリガーを優先し、取得できない場合は移動速度から疑似筆圧を作る。 */
+/** 幅変化の入力源。triggerは旧保存・外部利用との型互換のため残す。 */
 export type PressureSource = 'trigger' | 'speed';
 export interface PressureSample {
     value: number;

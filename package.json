@@ -1,7 +1,7 @@
 {
   "name": "xrift-dcpen",
-  "version": "0.3.0-multiplayer-poc.1",
-  "description": "DcPen multiplayer brush experiment for XRift — pen layers, scoped editing, pressure ribbon and diagnostics",
+  "version": "0.4.0-speed-fude-poc.1",
+  "description": "DcPen multiplayer brush experiment for XRift — speed dynamics, ribbon and calligraphy brush, pen layers and scoped editing",
   "type": "module",
   "main": "./lib/index.js",
   "module": "./lib/index.js",
