@@ -15,6 +15,7 @@ export default defineConfig({
     dts({
       insertTypesEntry: true,
       include: ['src/lib.ts', 'src/pen'],
+      exclude: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
       outDir: 'lib',
     }),
   ],
