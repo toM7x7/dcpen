@@ -8,7 +8,7 @@
 export { DcPen } from './pen/DcPen';
 export type { DcPenProps, DcPenDebugApi } from './pen/DcPen';
 export { BRUSH_REGISTRY, StrokeRenderer, buildRibbonGeometry } from './pen/brushes';
-export { DEFAULT_BRUSH, DEFAULT_RIBBON_SIZE, PEN_COLORS, RAINBOW } from './pen/types';
+export { DEFAULT_BRUSH, DEFAULT_RIBBON_SIZE, PEN_COLORS, RAINBOW, getStrokeOwnerId, getStrokePenIndex } from './pen/types';
 export type { BrushDefinition, RibbonGeometryData } from './pen/brushes';
 export type { BrushId, Stroke, StrokePoint } from './pen/types';
 //# sourceMappingURL=lib.d.ts.map

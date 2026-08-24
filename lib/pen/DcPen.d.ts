@@ -19,9 +19,17 @@ export interface DcPenProps {
     enableBrushControls?: boolean;
     defaultBrush?: BrushId;
     defaultRibbonSize?: number;
+    /** ローカルユーザーが最後に選択/保持した物理ペン番号 */
+    onSelectedPenChange?: (penIndex: number) => void;
     debugApi?: (api: DcPenDebugApi) => void;
 }
 /** XR Gamepadのアナログトリガーを優先し、取得できない場合は移動速度から疑似筆圧を作る。 */
+export type PressureSource = 'trigger' | 'speed';
+export interface PressureSample {
+    value: number;
+    source: PressureSource;
+}
+export declare function resolvePressureSample(source: XRInputSource | null, distance: number, deltaSeconds: number): PressureSample;
 export declare function resolvePressure(source: XRInputSource | null, distance: number, deltaSeconds: number): number;
-export declare const DcPen: ({ position, rotationY, syncId, enableBrushControls, defaultBrush, defaultRibbonSize, debugApi, }: DcPenProps) => import("react/jsx-runtime").JSX.Element;
+export declare const DcPen: ({ position, rotationY, syncId, enableBrushControls, defaultBrush, defaultRibbonSize, onSelectedPenChange, debugApi, }: DcPenProps) => import("react/jsx-runtime").JSX.Element;
 //# sourceMappingURL=DcPen.d.ts.map

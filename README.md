@@ -5,7 +5,7 @@
 *A QvPen-style spatial drawing pen for XRift worlds & items.*
 
 > このForkは原作者 [toming](https://github.com/tomingtoming/dcpen) さんのMIT版を土台に、
-> 「お絵描き保存ワールド」で線と平筆を比較するための実験版です。既定の描画は従来どおりLINEです。
+> 「お絵描き保存ワールド」でブラシとマルチプレイ描画を検証するための特化実験版です。既定の描画は従来どおりLINEです。
 
 ![DcPen](public/thumbnail.png)
 
@@ -15,12 +15,15 @@
 - **VR**: 左右どちらの手でもグリップ（握る）で掴む。**両手に1本ずつ持てる**。掴んだ瞬間の持ち方のまま手に追従（縦持ち・横持ち自由）。グリップを離すと**その場の空中に浮いて留まる**
 - 持ち手のトリガーで描く。**トリガー2連打（0.2秒）で消しゴムモード**＝ペン先が球になり、触れた部分だけ削れる**部分消し**（線は残りに分割。本家に無い拡張）
 - **消しゴム×3**: 掴んでトリガーで線に当てると、その線が1本消える（本家準拠）
-- ペンごとの **Respawn / Clear（色別消し）** ボタン、左パネルに **Undo / Clear All / All Reset**
+- ペンごとの **Respawn / Clear（自分の同ペン線を消去）** ボタン、左パネルに **Undo / Clear Mine / All Reset**
 - 線・持ち主・浮遊位置はインスタンス内で**全員に同期**。late joiner にも復元
 - **デスクトップ**: クリックで持つ／戻す・左ボタン長押しで描く
 - 描いた線はインスタンスが生きている限り残る＝**書き置き**ができる
-- `enableBrushControls` で **LINE / RIBBON** を切替。RIBBONはコントローラー姿勢とトリガー筆圧を帯メッシュへ反映
-- 筆圧を取得できない環境では描画速度から幅を補完。ブラシ情報も同期・late join復元に含む
+- `enableBrushControls` で、選択した物理ペンごとに **LINE / RIBBON** と太さを独立設定
+- RIBBONはコントローラー姿勢とトリガー筆圧を帯メッシュへ反映。筆圧を取得できない環境では描画速度から幅を補完
+- ライブ筆圧メーターに入力源（`TRIGGER` / `SPEED`）と1ストロークの最小・最大値を表示
+- **ALL / MINE / PEN** で表示を切替。Undo・消しゴム・Clearは操作した本人の線だけに作用
+- ストロークへ物理ペン番号・作者ID・表示名を保持し、ブラシ情報とともに同期・late join復元
 
 ## ワールドに置く
 
@@ -48,6 +51,7 @@ export const World = () => (
 | `enableBrushControls` | `false` | LINE/RIBBONと太さ比較UIを表示 |
 | `defaultBrush` | `'line'` | 初期ブラシ（`line` / `ribbon`） |
 | `defaultRibbonSize` | `0.035` | RIBBONの基準幅（m） |
+| `onSelectedPenChange` | - | ラックまたは空中のペンを選択・取得した時に物理ペン番号を通知 |
 
 依存（`react` / `three` / `@react-three/fiber` / `@react-three/drei` / `@react-three/rapier` / `@xrift/world-components`）はすべて peerDependencies です。XRift ワールドプロジェクトなら追加インストールは不要です。
 
@@ -71,7 +75,7 @@ npm install
 npm run dev        # devプレビュー (https, ?preview で設置プレビュー確認)
 npm run build      # XRiftアイテムのビルド (Module Federation)
 npm run build:lib  # npmライブラリのビルド (lib/)
-npm test           # ブラシ形状と旧イベント互換のテスト
+npm test           # ブラシ形状・作者/ペン情報・旧イベント互換のテスト
 ```
 
 ## License

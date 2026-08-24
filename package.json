@@ -1,7 +1,7 @@
 {
   "name": "xrift-dcpen",
-  "version": "0.2.0-brush-poc.1",
-  "description": "DcPen brush experiment for XRift — line-compatible spatial drawing with pressure ribbon brush",
+  "version": "0.3.0-multiplayer-poc.1",
+  "description": "DcPen multiplayer brush experiment for XRift — pen layers, scoped editing, pressure ribbon and diagnostics",
   "type": "module",
   "main": "./lib/index.js",
   "module": "./lib/index.js",

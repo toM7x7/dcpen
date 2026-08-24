@@ -15,7 +15,7 @@ export declare class StrokeStore {
     all(): Stroke[];
     finishedStrokes(): Stroke[];
     /** 増分書き込み（自エコー・重複到着に冪等）。旧lineイベントも受理する */
-    applySegment(sid: string, color: string, off: number, pts: number[], hueOffset?: number, meta?: Pick<SegEvent, 'brushId' | 'size' | 'orientations' | 'pressures' | 'timestamps'>): void;
+    applySegment(sid: string, color: string, off: number, pts: number[], hueOffset?: number, meta?: Pick<SegEvent, 'brushId' | 'size' | 'orientations' | 'pressures' | 'timestamps' | 'penIndex' | 'ownerUserId' | 'ownerDisplayName'>): void;
     markFinished(sid: string): void;
     /** 完成形ストロークの一括投入（late join時のinstance stateマージ） */
     merge(strokes: Stroke[]): void;

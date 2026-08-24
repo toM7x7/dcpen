@@ -23,6 +23,8 @@ import {
   PEN_COLORS,
   RAINBOW,
   SEG_BATCH_POINTS,
+  getStrokeOwnerId,
+  getStrokePenIndex,
   roundMm,
 } from './types'
 import type { BrushId, EndEvent, SegEvent, Stroke, UndoEvent } from './types'
@@ -105,6 +107,8 @@ export interface DcPenProps {
   enableBrushControls?: boolean
   defaultBrush?: BrushId
   defaultRibbonSize?: number
+  /** ローカルユーザーが最後に選択/保持した物理ペン番号 */
+  onSelectedPenChange?: (penIndex: number) => void
   debugApi?: (api: DcPenDebugApi) => void
 }
 
@@ -146,6 +150,9 @@ interface ActiveStroke {
   size: number
   startedAt: number
   lastSampleAt: number
+  minPressure: number
+  maxPressure: number
+  pressureSource: PressureSource
 }
 
 function roundedQuaternion(quaternion: Quaternion): number[] {
@@ -155,14 +162,25 @@ function roundedQuaternion(quaternion: Quaternion): number[] {
 }
 
 /** XR Gamepadのアナログトリガーを優先し、取得できない場合は移動速度から疑似筆圧を作る。 */
-export function resolvePressure(source: XRInputSource | null, distance: number, deltaSeconds: number): number {
+export type PressureSource = 'trigger' | 'speed'
+
+export interface PressureSample {
+  value: number
+  source: PressureSource
+}
+
+export function resolvePressureSample(source: XRInputSource | null, distance: number, deltaSeconds: number): PressureSample {
   const raw = source?.gamepad?.buttons[0]?.value
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
-    return Math.round(Math.max(0.08, Math.min(1, raw)) * 1000) / 1000
+    return { value: Math.round(Math.max(0.08, Math.min(1, raw)) * 1000) / 1000, source: 'trigger' }
   }
-  if (distance <= 0 || deltaSeconds <= 0) return 0.7
+  if (distance <= 0 || deltaSeconds <= 0) return { value: 0.7, source: 'speed' }
   const speed = distance / deltaSeconds
-  return Math.round(Math.max(0.2, Math.min(1, 1 - speed * 0.45)) * 1000) / 1000
+  return { value: Math.round(Math.max(0.2, Math.min(1, 1 - speed * 0.45)) * 1000) / 1000, source: 'speed' }
+}
+
+export function resolvePressure(source: XRInputSource | null, distance: number, deltaSeconds: number): number {
+  return resolvePressureSample(source, distance, deltaSeconds).value
 }
 
 function sliceStrokeMeta(stroke: Stroke, start: number, end: number) {
@@ -172,6 +190,9 @@ function sliceStrokeMeta(stroke: Stroke, start: number, end: number) {
     orientations: stroke.orientations?.slice(start * 4, end * 4),
     pressures: stroke.pressures?.slice(start, end),
     timestamps: stroke.timestamps?.slice(start, end),
+    penIndex: stroke.penIndex,
+    ownerUserId: stroke.ownerUserId,
+    ownerDisplayName: stroke.ownerDisplayName,
   }
 }
 
@@ -200,6 +221,17 @@ interface BrushSettings {
   size: number
 }
 
+type VisibilityMode = 'all' | 'mine' | 'pen'
+
+interface PressureTelemetry {
+  penIndex: number
+  value: number
+  min: number
+  max: number
+  source: PressureSource
+  active: boolean
+}
+
 /** 消しゴムモードは手ごとに独立（両手持ち時に片方だけ消しゴムにできる） */
 type EraserModes = Record<Hand, boolean>
 
@@ -224,11 +256,14 @@ export const DcPen = ({
   enableBrushControls = false,
   defaultBrush = DEFAULT_BRUSH,
   defaultRibbonSize = DEFAULT_RIBBON_SIZE,
+  onSelectedPenChange,
   debugApi,
 }: DcPenProps) => {
   const SYNC_ID = syncId
   const scene = useThree((s) => s.scene)
   const gl = useThree((s) => s.gl)
+  const { localUser } = useUsers()
+  const localUserId = localUser?.id ?? 'dev-local'
 
   // ---- 共有ストローク状態 ----
   const storeRef = useRef<StrokeStore | null>(null)
@@ -236,10 +271,39 @@ export const DcPen = ({
   const store = storeRef.current
   const [, setTick] = useState(0)
   const bump = useCallback(() => setTick((n) => n + 1), [])
-  const [brushId, setBrushId] = useState<BrushId>(enableBrushControls ? defaultBrush : 'line')
-  const [brushSize, setBrushSize] = useState(() => Math.max(0.012, Math.min(0.08, defaultRibbonSize)))
-  const brushSettings = useRef<BrushSettings>({ id: brushId, size: brushSize })
-  brushSettings.current = { id: brushId, size: brushSize }
+  const initialSize = Math.max(0.012, Math.min(0.08, defaultRibbonSize))
+  const initialBrush = enableBrushControls ? defaultBrush : 'line'
+  const [selectedPenIndex, setSelectedPenIndex] = useState(0)
+  const [visibilityMode, setVisibilityMode] = useState<VisibilityMode>('all')
+  const [pressureTelemetry, setPressureTelemetry] = useState<PressureTelemetry>({
+    penIndex: 0, value: 0, min: 0, max: 0, source: 'speed', active: false,
+  })
+  const [brushSettingsState, setBrushSettingsState] = useInstanceState<BrushSettings[]>(
+    `${SYNC_ID}:brush-settings-v1`,
+    Array.from({ length: PEN_COUNT }, () => ({ id: initialBrush, size: initialSize })),
+  )
+  const brushSettingsByPen = useRef<BrushSettings[]>([])
+  brushSettingsByPen.current = Array.from({ length: PEN_COUNT }, (_, index) => {
+    const candidate = Array.isArray(brushSettingsState) ? brushSettingsState[index] : undefined
+    return candidate && (candidate.id === 'line' || candidate.id === 'ribbon')
+      ? { id: candidate.id, size: Math.max(0.012, Math.min(0.08, candidate.size || initialSize)) }
+      : { id: initialBrush, size: initialSize }
+  })
+  const selectedBrush = brushSettingsByPen.current[selectedPenIndex] ?? { id: initialBrush, size: initialSize }
+
+  const selectPen = useCallback((penIndex: number) => {
+    if (penIndex < 0 || penIndex >= PEN_COUNT) return
+    setSelectedPenIndex(penIndex)
+    onSelectedPenChange?.(penIndex)
+  }, [onSelectedPenChange])
+
+  const updateSelectedBrush = useCallback((update: Partial<BrushSettings>) => {
+    const current = brushSettingsByPen.current
+    const next = current.map((settings, index) => index === selectedPenIndex ? { ...settings, ...update } : settings)
+    setBrushSettingsState(next)
+  }, [selectedPenIndex, setBrushSettingsState])
+
+  useEffect(() => onSelectedPenChange?.(0), [onSelectedPenChange])
 
   const [persisted, setPersisted] = useInstanceState<Stroke[]>(`${SYNC_ID}:strokes`, [])
   useEffect(() => {
@@ -296,27 +360,40 @@ export const DcPen = ({
     if (persistTimer.current !== null) persistNow()
   })
 
-  // ---- 自分の線のundoスタック（どの色のペンで描いたかは問わない） ----
-  const undoStack = useRef<string[]>([])
-  const pushUndoSid = useCallback((sid: string) => {
-    undoStack.current.push(sid)
+  // ---- 自分の線のundoスタック（物理ペンごと） ----
+  const undoStack = useRef<Record<number, string[]>>({})
+  const pushUndoSid = useCallback((sid: string, penIndex: number) => {
+    const stack = undoStack.current[penIndex] ?? []
+    stack.push(sid)
+    undoStack.current[penIndex] = stack
   }, [])
   const doUndo = useCallback(() => {
-    const sid = undoStack.current.pop()
+    const sid = undoStack.current[selectedPenIndex]?.pop()
     if (!sid) return
     store.remove(sid)
     emitUndo({ sid })
     persistFinished()
     bump()
-  }, [store, emitUndo, persistFinished, bump])
+  }, [store, emitUndo, persistFinished, bump, selectedPenIndex])
 
   const clearAll = useCallback(() => {
     store.clear()
     emitClear({})
     persistNow()
-    undoStack.current = []
+    undoStack.current = {}
     bump()
   }, [store, emitClear, persistNow, bump])
+
+  const clearMine = useCallback(() => {
+    for (const stroke of store.all()) {
+      if (getStrokeOwnerId(stroke) !== localUserId) continue
+      store.remove(stroke.sid)
+      emitUndo({ sid: stroke.sid })
+    }
+    undoStack.current = {}
+    persistFinished()
+    bump()
+  }, [bump, emitUndo, localUserId, persistFinished, store])
 
   /** 消しゴム/色別Clearが線を消すときの共通処理（自他問わず） */
   const eraseStroke = useCallback(
@@ -329,11 +406,11 @@ export const DcPen = ({
     [store, emitUndo, persistFinished, bump],
   )
 
-  /** QvPenのペン別Clear相当: その色で描かれた線をぜんぶ消す */
-  const clearColor = useCallback(
-    (c: string) => {
+  /** 物理ペン別Clear: そのペンで自分が描いた線だけを消す */
+  const clearPenMine = useCallback(
+    (penIndex: number) => {
       for (const s of store.all()) {
-        if (s.color === c) {
+        if (getStrokePenIndex(s) === penIndex && getStrokeOwnerId(s) === localUserId) {
           store.remove(s.sid)
           emitUndo({ sid: s.sid })
         }
@@ -341,7 +418,7 @@ export const DcPen = ({
       persistFinished()
       bump()
     },
-    [store, emitUndo, persistFinished, bump],
+    [store, emitUndo, persistFinished, bump, localUserId],
   )
 
   useEffect(() => {
@@ -446,6 +523,11 @@ export const DcPen = ({
 
   // ---- レイアウト（QvPenのラック風・机なし空中固定） ----
   const strokes = store.all()
+  const visibleStrokes = strokes.filter((stroke) => {
+    if (visibilityMode === 'mine') return getStrokeOwnerId(stroke) === localUserId
+    if (visibilityMode === 'pen') return getStrokePenIndex(stroke) === selectedPenIndex
+    return true
+  })
   pruneStrokeRenderCaches(new Set(strokes.map((s) => `${SYNC_ID}|${s.sid}`)))
   const penX = (i: number) => (i - (PEN_COUNT - 1) / 2) * 0.17
   const eraserX = (i: number) => penX(PEN_COUNT - 1) + 0.32 + i * 0.13
@@ -477,7 +559,9 @@ export const DcPen = ({
             eraserMode={eraserMode}
             eraseStroke={eraseStroke}
             putAwayFns={putAwayFns}
-            brushSettings={brushSettings}
+            brushSettingsByPen={brushSettingsByPen}
+            onSelectPen={selectPen}
+            onPressureTelemetry={setPressureTelemetry}
           />
         ))}
 
@@ -502,7 +586,9 @@ export const DcPen = ({
             eraserMode={eraserMode}
             eraseStroke={eraseStroke}
             putAwayFns={putAwayFns}
-            brushSettings={brushSettings}
+            brushSettingsByPen={brushSettingsByPen}
+            onSelectPen={selectPen}
+            onPressureTelemetry={setPressureTelemetry}
           />
         ))}
 
@@ -536,8 +622,8 @@ export const DcPen = ({
               color="#4a3b57"
               label="Clear"
               fontSize={0.017}
-              interactionText={`${COLOR_NAMES[i]}の線をぜんぶ消す`}
-              onInteract={() => clearColor(c)}
+              interactionText={`${COLOR_NAMES[i]}のペンで自分が描いた線を消す`}
+              onInteract={() => { selectPen(i); clearPenMine(i) }}
             />
           </group>
         ))}
@@ -555,10 +641,10 @@ export const DcPen = ({
           id={`${SYNC_ID}-clear`}
           position={[penX(0) - 0.35, 1.2, 0]}
           color="#8a0015"
-          label="Clear All"
+          label="Clear Mine"
           fontSize={0.019}
-          interactionText="線をぜんぶ消す"
-          onInteract={clearAll}
+          interactionText="自分が描いた線だけをぜんぶ消す"
+          onInteract={clearMine}
         />
         <LabeledButton
           id={`${SYNC_ID}-reset`}
@@ -578,21 +664,21 @@ export const DcPen = ({
               id={`${SYNC_ID}-brush-line`}
               position={[-0.34, 1.78, 0]}
               size={[0.3, 0.12, 0.035]}
-              color={brushId === 'line' ? '#0f766e' : '#475569'}
+              color={selectedBrush.id === 'line' ? '#0f766e' : '#475569'}
               label="LINE"
               fontSize={0.035}
               interactionText="通常のDcPen線に切り替える"
-              onInteract={() => setBrushId('line')}
+              onInteract={() => updateSelectedBrush({ id: 'line' })}
             />
             <LabeledButton
               id={`${SYNC_ID}-brush-ribbon`}
               position={[0.02, 1.78, 0]}
               size={[0.36, 0.12, 0.035]}
-              color={brushId === 'ribbon' ? '#c2410c' : '#475569'}
+              color={selectedBrush.id === 'ribbon' ? '#c2410c' : '#475569'}
               label="RIBBON"
               fontSize={0.032}
               interactionText="筆圧リボン筆に切り替える"
-              onInteract={() => setBrushId('ribbon')}
+              onInteract={() => updateSelectedBrush({ id: 'ribbon' })}
             />
             <LabeledButton
               id={`${SYNC_ID}-brush-thinner`}
@@ -602,7 +688,7 @@ export const DcPen = ({
               label="THIN"
               fontSize={0.027}
               interactionText="リボン筆を細くする"
-              onInteract={() => setBrushSize((size) => Math.max(0.012, Math.round((size - 0.006) * 1000) / 1000))}
+              onInteract={() => updateSelectedBrush({ size: Math.max(0.012, Math.round((selectedBrush.size - 0.006) * 1000) / 1000) })}
             />
             <LabeledButton
               id={`${SYNC_ID}-brush-wider`}
@@ -612,11 +698,34 @@ export const DcPen = ({
               label="WIDE"
               fontSize={0.027}
               interactionText="リボン筆を太くする"
-              onInteract={() => setBrushSize((size) => Math.min(0.08, Math.round((size + 0.006) * 1000) / 1000))}
+              onInteract={() => updateSelectedBrush({ size: Math.min(0.08, Math.round((selectedBrush.size + 0.006) * 1000) / 1000) })}
             />
             <Text position={[0.84, 1.78, 0.02]} fontSize={0.032} color="#172033" anchorX="left">
-              {`${Math.round(brushSize * 1000)}mm`}
+              {`P${selectedPenIndex + 1} ${Math.round(selectedBrush.size * 1000)}mm`}
             </Text>
+            <Text position={[-0.72, 2.1, 0.02]} fontSize={0.033} color="#172033" anchorX="left">
+              {`PRESS ${Math.round((pressureTelemetry.penIndex === selectedPenIndex ? pressureTelemetry.value : 0) * 100)}% ${pressureTelemetry.source.toUpperCase()}`}
+            </Text>
+            <Text position={[0.05, 2.1, 0.02]} fontSize={0.028} color="#9a3412" anchorX="left">
+              {pressureTelemetry.penIndex === selectedPenIndex && !pressureTelemetry.active
+                ? `RANGE ${Math.round(pressureTelemetry.min * 100)}-${Math.round(pressureTelemetry.max * 100)}%`
+                : 'DRAW TO TEST'}
+            </Text>
+            <group position={[-0.7, 2.2, 0.01]}>
+              {Array.from({ length: 10 }, (_, meterIndex) => (
+                <mesh key={meterIndex} position={[meterIndex * 0.14, 0, 0]}>
+                  <boxGeometry args={[0.11, 0.055, 0.025]} />
+                  <meshStandardMaterial
+                    color={meterIndex < Math.ceil((pressureTelemetry.penIndex === selectedPenIndex ? pressureTelemetry.value : 0) * 10) ? '#f97316' : '#cbd5e1'}
+                    emissive={meterIndex < Math.ceil((pressureTelemetry.penIndex === selectedPenIndex ? pressureTelemetry.value : 0) * 10) ? '#f97316' : '#000000'}
+                    emissiveIntensity={0.4}
+                  />
+                </mesh>
+              ))}
+            </group>
+            <LabeledButton id={`${SYNC_ID}-view-all`} position={[-0.42, 2.34, 0]} size={[0.3, 0.1, 0.03]} color={visibilityMode === 'all' ? '#2563eb' : '#64748b'} label="ALL" fontSize={0.028} interactionText="全員の線を表示" onInteract={() => setVisibilityMode('all')} />
+            <LabeledButton id={`${SYNC_ID}-view-mine`} position={[-0.06, 2.34, 0]} size={[0.34, 0.1, 0.03]} color={visibilityMode === 'mine' ? '#2563eb' : '#64748b'} label="MINE" fontSize={0.028} interactionText="自分の線だけ表示" onInteract={() => setVisibilityMode('mine')} />
+            <LabeledButton id={`${SYNC_ID}-view-pen`} position={[0.33, 2.34, 0]} size={[0.34, 0.1, 0.03]} color={visibilityMode === 'pen' ? '#2563eb' : '#64748b'} label="PEN" fontSize={0.028} interactionText="選択中の物理ペンの線だけ表示" onInteract={() => setVisibilityMode('pen')} />
           </group>
         ) : null}
       </XRGrabProvider>
@@ -624,7 +733,7 @@ export const DcPen = ({
       {/* ストロークはワールド座標なのでシーン直下に描く（描画時のみスプライン細分） */}
       {createPortal(
         <group>
-          {strokes.map((s) => (
+          {visibleStrokes.map((s) => (
             <StrokeRenderer key={s.sid} cacheKey={`${SYNC_ID}|${s.sid}`} stroke={s} count={s.pts.length} />
           ))}
         </group>,
@@ -650,11 +759,13 @@ interface PenSlotProps {
   bump: () => void
   drawInput: MutableRefObject<DrawInput>
   anyHeldByHand: MutableRefObject<Record<Hand, boolean>>
-  pushUndoSid: (sid: string) => void
+  pushUndoSid: (sid: string, penIndex: number) => void
   eraserMode: MutableRefObject<EraserModes>
   eraseStroke: (sid: string) => void
   putAwayFns: MutableRefObject<((() => void) | null)[]>
-  brushSettings: MutableRefObject<BrushSettings>
+  brushSettingsByPen: MutableRefObject<BrushSettings[]>
+  onSelectPen: (penIndex: number) => void
+  onPressureTelemetry: (telemetry: PressureTelemetry) => void
 }
 
 /** ラックの1本＝独立した持ち主を持つペン/消しゴム */
@@ -676,13 +787,16 @@ const PenSlot = ({
   eraserMode,
   eraseStroke,
   putAwayFns,
-  brushSettings,
+  brushSettingsByPen,
+  onSelectPen,
+  onPressureTelemetry,
 }: PenSlotProps) => {
   const SYNC_ID = syncId
   const { localUser, getMovement, getLocalMovement, getAvatarHeight } = useUsers()
   const scene = useThree((s) => s.scene)
 
   const myId = localUser?.id ?? 'dev-local'
+  const myDisplayName = localUser?.displayName || '名前なしユーザー'
   const myIdRef = useRef(myId)
   myIdRef.current = myId
 
@@ -696,6 +810,7 @@ const PenSlot = ({
   poseRef.current = pose
 
   const activeRef = useRef<ActiveStroke | null>(null)
+  const lastTelemetryAt = useRef(0)
   const seqRef = useRef(0)
   /**
    * このペンで今まで描いた総点数（このクライアントセッション内で単調増加）。
@@ -729,6 +844,10 @@ const PenSlot = ({
     const s = store.get(a.sid)
     if (!s || a.count < 2) {
       store.remove(a.sid)
+      onPressureTelemetry({
+        penIndex: index, value: a.maxPressure, min: a.minPressure, max: a.maxPressure,
+        source: a.pressureSource, active: false,
+      })
       bump()
       return
     }
@@ -737,10 +856,18 @@ const PenSlot = ({
     }
     emitEnd({ sid: a.sid })
     store.markFinished(a.sid)
-    pushUndoSid(a.sid)
+    pushUndoSid(a.sid, index)
+    onPressureTelemetry({
+      penIndex: index,
+      value: a.maxPressure,
+      min: a.minPressure,
+      max: a.maxPressure,
+      source: a.pressureSource,
+      active: false,
+    })
     persistFinished()
     bump()
-  }, [store, emitSeg, emitEnd, persistFinished, pushUndoSid, bump])
+  }, [store, emitSeg, emitEnd, persistFinished, pushUndoSid, bump, index, onPressureTelemetry])
 
   /** いまの実体のワールド姿勢（ラック上 or 空中）。ラック上はアンカーの実測 */
   const restingWorldPose = useCallback(
@@ -802,6 +929,7 @@ const PenSlot = ({
       quaternion: new Quaternion(),
     },
     onGrabStart: (hand) => {
+      if (kind === 'pen') onSelectPen(index)
       setHolder({ id: myIdRef.current, hand })
       myHeldHandRef.current = hand
       anyHeldByHand.current[hand] = true
@@ -848,6 +976,7 @@ const PenSlot = ({
   /** 消しゴム(オブジェクト)動作: 先端に触れている線を消す（本家準拠で線1本単位） */
   const erasePass = useCallback(() => {
     for (const s of store.all()) {
+      if (getStrokeOwnerId(s) !== myIdRef.current) continue
       let hit = false
       for (let i = 0; i + 2 < s.pts.length; i += 3) {
         const x = s.pts[i]
@@ -870,6 +999,7 @@ const PenSlot = ({
    */
   const partialErasePass = useCallback(() => {
     for (const s of store.all()) {
+      if (getStrokeOwnerId(s) !== myIdRef.current || getStrokePenIndex(s) !== index) continue
       const pts = s.pts
       let touched = false
       const runs: { pts: number[]; start: number }[] = []
@@ -1019,7 +1149,8 @@ const PenSlot = ({
         if (tip.current.distanceTo(pressAnchor.current) < MIN_SEGMENT * 1.5) return
         seqRef.current += 1
         const startedAt = Math.round(clock.elapsedTime * 1000)
-        const settings = brushSettings.current
+        const settings = brushSettingsByPen.current[index] ?? { id: DEFAULT_BRUSH, size: DEFAULT_RIBBON_SIZE }
+        const firstSample = resolvePressureSample(input.source, 0, 0)
         a = {
           sid: `${myIdRef.current}:${index}:${Date.now().toString(36)}:${seqRef.current}`,
           color,
@@ -1030,9 +1161,11 @@ const PenSlot = ({
           size: settings.size,
           startedAt,
           lastSampleAt: startedAt,
+          minPressure: firstSample.value,
+          maxPressure: firstSample.value,
+          pressureSource: firstSample.source,
         }
         activeRef.current = a
-        const firstPressure = resolvePressure(input.source, 0, 0)
         store.applySegment(
           a.sid,
           a.color,
@@ -1043,10 +1176,17 @@ const PenSlot = ({
             brushId: a.brushId,
             size: a.size,
             orientations: roundedQuaternion(_tipQ),
-            pressures: [firstPressure],
+            pressures: [firstSample.value],
             timestamps: [0],
+            penIndex: index,
+            ownerUserId: myIdRef.current,
+            ownerDisplayName: myDisplayName,
           },
         )
+        onPressureTelemetry({
+          penIndex: index, value: firstSample.value, min: firstSample.value, max: firstSample.value,
+          source: firstSample.source, active: true,
+        })
         a.count = 1
         nextHueOffset.current += 1
         lastPt.current.copy(pressAnchor.current)
@@ -1058,7 +1198,11 @@ const PenSlot = ({
       const distance = tip.current.distanceTo(lastPt.current)
       if (distance < MIN_SEGMENT) return
       const sampledAt = Math.round(clock.elapsedTime * 1000)
-      const pressure = resolvePressure(input.source, distance, (sampledAt - a.lastSampleAt) / 1000)
+      const pressureSample = resolvePressureSample(input.source, distance, (sampledAt - a.lastSampleAt) / 1000)
+      const pressure = pressureSample.value
+      a.minPressure = Math.min(a.minPressure, pressure)
+      a.maxPressure = Math.max(a.maxPressure, pressure)
+      a.pressureSource = pressureSample.source
       lastPt.current.copy(tip.current)
       store.applySegment(
         a.sid,
@@ -1072,10 +1216,20 @@ const PenSlot = ({
           orientations: roundedQuaternion(_tipQ),
           pressures: [pressure],
           timestamps: [sampledAt - a.startedAt],
+          penIndex: index,
+          ownerUserId: myIdRef.current,
+          ownerDisplayName: myDisplayName,
         },
       )
       a.count += 1
       a.lastSampleAt = sampledAt
+      if (sampledAt - lastTelemetryAt.current >= 100) {
+        lastTelemetryAt.current = sampledAt
+        onPressureTelemetry({
+          penIndex: index, value: pressure, min: a.minPressure, max: a.maxPressure,
+          source: pressureSample.source, active: true,
+        })
+      }
       nextHueOffset.current += 1
       if (a.count - a.sent >= SEG_BATCH_POINTS) {
         const s = store.get(a.sid)
@@ -1106,6 +1260,7 @@ const PenSlot = ({
         : 'だれかが使用中'
 
   const onRackInteract = useCallback(() => {
+    if (kind === 'pen') onSelectPen(index)
     const h = holderRef.current
     if (h === null) {
       if (poseRef.current) {
@@ -1116,7 +1271,7 @@ const PenSlot = ({
     } else if (grab.isHeld) {
       returnToRack()
     }
-  }, [grab, returnToRack, putAway])
+  }, [grab, returnToRack, putAway, index, kind, onSelectPen])
 
   return (
     <group position={slotOffset}>
@@ -1155,7 +1310,10 @@ const PenSlot = ({
           >
             <Interactable
               id={`${SYNC_ID}-slot-air-${index}`}
-              onInteract={() => grab.grabViaClick()}
+              onInteract={() => {
+                if (kind === 'pen') onSelectPen(index)
+                grab.grabViaClick()
+              }}
               interactionText={`${noun}を持つ`}
             >
               {kind === 'pen' ? <PencilMesh color={color} /> : <EraserMesh color={color} />}

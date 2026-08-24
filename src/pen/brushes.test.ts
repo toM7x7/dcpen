@@ -23,8 +23,8 @@ describe('RibbonBrush', () => {
 
     const firstWidth = Math.abs((geometry?.positions[3] ?? 0) - (geometry?.positions[0] ?? 0))
     const secondWidth = Math.abs((geometry?.positions[9] ?? 0) - (geometry?.positions[6] ?? 0))
-    expect(firstWidth).toBeCloseTo(0.01, 4)
-    expect(secondWidth).toBeCloseTo(0.04, 4)
+    expect(firstWidth).toBeCloseTo(0.006, 4)
+    expect(secondWidth).toBeCloseTo(0.056, 4)
   })
 
   it('merges old line events and brush metadata without changing the old contract', () => {
@@ -38,6 +38,27 @@ describe('RibbonBrush', () => {
       size: 0.04,
       pressures: [0, 1],
       timestamps: [0, 16],
+    })
+  })
+
+  it('retains the physical pen and stroke author while merging segments', () => {
+    const store = new StrokeStore()
+    store.applySegment(ribbon.sid, ribbon.color, 0, ribbon.pts.slice(0, 3), 0, {
+      penIndex: 2,
+      ownerUserId: 'u',
+      ownerDisplayName: 'User U',
+    })
+    store.applySegment(ribbon.sid, ribbon.color, 1, ribbon.pts.slice(3), 1, {
+      penIndex: 2,
+      ownerUserId: 'u',
+      ownerDisplayName: 'User U',
+    })
+
+    expect(store.get(ribbon.sid)).toMatchObject({
+      penIndex: 2,
+      ownerUserId: 'u',
+      ownerDisplayName: 'User U',
+      pts: ribbon.pts,
     })
   })
 })

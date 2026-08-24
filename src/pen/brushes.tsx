@@ -98,7 +98,8 @@ export function buildRibbonGeometry(stroke: Stroke): RibbonGeometryData | null {
     }
     side.normalize()
     const pressure = Math.max(0, Math.min(1, stroke.pressures?.[index] ?? 0.7))
-    const halfWidth = width * (0.25 + pressure * 0.75) * 0.5
+    // 実機で差を読み取りやすいよう、実験版は弱筆圧15%〜強筆圧140%まで誇張する。
+    const halfWidth = width * (0.15 + pressure * 1.25) * 0.5
     const left = point.clone().addScaledVector(side, -halfWidth)
     const right = point.clone().addScaledVector(side, halfWidth)
     positions.set([left.x, left.y, left.z, right.x, right.y, right.z], index * 6)

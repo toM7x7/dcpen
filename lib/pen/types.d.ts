@@ -30,6 +30,11 @@ export interface Stroke {
     pressures?: number[];
     /** ストローク開始からの経過ms */
     timestamps?: number[];
+    /** 物理ペンスロット。旧データはsidから復元する */
+    penIndex?: number;
+    /** ストロークを描いたユーザー。ペンを受け渡しても作者は線ごとに残る */
+    ownerUserId?: string;
+    ownerDisplayName?: string;
 }
 /** 描画中ストロークの増分同期イベント。off は点単位（floatではない）の書き込み開始位置 */
 export interface SegEvent {
@@ -44,6 +49,9 @@ export interface SegEvent {
     orientations?: number[];
     pressures?: number[];
     timestamps?: number[];
+    penIndex?: number;
+    ownerUserId?: string;
+    ownerDisplayName?: string;
 }
 export interface EndEvent {
     sid: string;
@@ -76,4 +84,6 @@ export declare const RAINBOW = "rainbow";
 export declare const PEN_COLORS: readonly string[];
 /** 座標をmm精度に丸める（同期ペイロード削減） */
 export declare function roundMm(v: number): number;
+export declare function getStrokePenIndex(stroke: Pick<Stroke, 'sid' | 'penIndex'>): number | null;
+export declare function getStrokeOwnerId(stroke: Pick<Stroke, 'sid' | 'ownerUserId'>): string | null;
 //# sourceMappingURL=types.d.ts.map

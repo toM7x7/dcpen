@@ -35,7 +35,7 @@ export class StrokeStore {
     off: number,
     pts: number[],
     hueOffset = 0,
-    meta: Pick<SegEvent, 'brushId' | 'size' | 'orientations' | 'pressures' | 'timestamps'> = {},
+    meta: Pick<SegEvent, 'brushId' | 'size' | 'orientations' | 'pressures' | 'timestamps' | 'penIndex' | 'ownerUserId' | 'ownerDisplayName'> = {},
   ): void {
     let s = this.strokes.get(sid)
     if (!s) {
@@ -49,11 +49,17 @@ export class StrokeStore {
         orientations: meta.orientations ? [] : undefined,
         pressures: meta.pressures ? [] : undefined,
         timestamps: meta.timestamps ? [] : undefined,
+        penIndex: meta.penIndex,
+        ownerUserId: meta.ownerUserId,
+        ownerDisplayName: meta.ownerDisplayName,
       }
       this.strokes.set(sid, s)
     }
     if (meta.brushId !== undefined) s.brushId = meta.brushId
     if (meta.size !== undefined) s.size = meta.size
+    if (meta.penIndex !== undefined) s.penIndex = meta.penIndex
+    if (meta.ownerUserId !== undefined) s.ownerUserId = meta.ownerUserId
+    if (meta.ownerDisplayName !== undefined) s.ownerDisplayName = meta.ownerDisplayName
     const base = off * 3
     for (let i = 0; i < pts.length; i++) {
       s.pts[base + i] = pts[i]
@@ -88,6 +94,9 @@ export class StrokeStore {
         orientations: s.orientations ? [...s.orientations] : undefined,
         pressures: s.pressures ? [...s.pressures] : undefined,
         timestamps: s.timestamps ? [...s.timestamps] : undefined,
+        penIndex: s.penIndex,
+        ownerUserId: s.ownerUserId,
+        ownerDisplayName: s.ownerDisplayName,
       })
       this.finished.add(s.sid)
       this.finishedOrder.push(s.sid)
