@@ -1,6 +1,6 @@
 {
   "name": "xrift-dcpen",
-  "version": "0.5.0-quick-ring.0",
+  "version": "0.5.0-quick-ring.1",
   "description": "DcPen multiplayer brush experiment for XRift — pen-centered quick ring, per-pen colors, speed dynamics, ribbon and calligraphy",
   "type": "module",
   "main": "./lib/index.js",
