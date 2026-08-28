@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { MutableRefObject, ReactNode } from 'react'
 import { createPortal, useFrame, useThree } from '@react-three/fiber'
 import { Text } from '@react-three/drei'
-import { Euler, Group, Matrix4, Mesh, Quaternion, Vector3 } from 'three'
+import { Camera, DoubleSide, Euler, Group, Matrix4, Mesh, Quaternion, Vector3 } from 'three'
 import {
   Interactable,
   useInstanceEvent,
@@ -30,6 +30,13 @@ import {
   speedToWidthValue,
 } from './types'
 import type { BrushId, EndEvent, PenToolMode, SegEvent, Stroke, UndoEvent } from './types'
+import {
+  QUICK_RING_COLORS,
+  QUICK_RING_TOOL_ITEMS,
+  initialRackColors,
+  normalizePenCount,
+  radialPosition,
+} from './quickRing'
 
 /**
  * ペンラック — QvPen準拠の空間らくがきペン（アイテム版）。
@@ -42,7 +49,7 @@ import type { BrushId, EndEvent, PenToolMode, SegEvent, Stroke, UndoEvent } from
  * - VR: **左右どちらの手でも**グリップ(握る)で掴む。**片手1本＝両手で2本同時持ち可**。
  *   掴んだ瞬間の相対姿勢のまま手にくっつく（縦持ち・横持ち自由＝VRC Pickup相当）。
  *   グリップを離すとその場の空中に浮いて留まる
- * - 持ち手のトリガーで描く。**トリガー2回(0.2秒以内)でLINE/RIBBON/FUDE/消しゴムを循環**。
+ * - 持ち手のトリガーで描く。**トリガー2回（既定0.3秒以内）でクイックリング、無効時は道具を循環**。
  *   消しゴムではペン先が球になり、触れた部分だけ削る**部分消し**
  *   （線は残り部分に分割される。本家に無い独自拡張）
  * - 消しゴム3個: 掴んでトリガーを押しながら線に当てると**その線1本を消す**
@@ -70,6 +77,11 @@ const COLOR_NAMES = [
   '虹',
 ]
 
+const getColorName = (color: string): string => {
+  const index = PEN_COLORS.indexOf(color)
+  return index >= 0 ? (COLOR_NAMES[index] ?? color) : color
+}
+
 /** 消しゴム（QvPenは3個） */
 const ERASER_COLORS = ['#8e4a5b', '#3f8f6a', '#3f6ba0']
 
@@ -79,8 +91,14 @@ const GRAB_RADIUS = 0.45
 const ERASE_RADIUS = 0.07
 /** ペン先消しゴムモードの半径＝**部分消し**（触れた点だけ削って線を分割する） */
 const PARTIAL_ERASE_RADIUS = 0.04
-/** トリガー/クリックのダブルクリック判定（QvPen: clickTimeInterval = 0.2s） */
-const DOUBLE_CLICK_MS = 200
+/** トリガー/クリックのダブルクリック判定。実機で取りこぼしにくい300msへ拡張。 */
+const DOUBLE_CLICK_MS = 300
+/** クイックリングの選択距離・滞在時間・自動終了時間 */
+const QUICK_RING_HIT_RADIUS = 0.052
+const QUICK_RING_DWELL_MS = 300
+const QUICK_RING_TIMEOUT_MS = 6500
+const QUICK_RING_TOOL_RADIUS = 0.18
+const QUICK_RING_COLOR_RADIUS = 0.225
 /**
  * 遅参者向け全量スナップショット書き込みの間引き窓。
  * setPersistedは差分でなく毎回フル値（全ストローク）を全員へ送るため、確定のたびに
@@ -99,6 +117,24 @@ export interface DcPenDebugApi {
   inject: (strokes: Stroke[]) => void
 }
 
+interface QuickRingRequest {
+  penIndex: number
+  hand: Hand
+  nonce: number
+  preview?: boolean
+  previewPage?: QuickRingPage
+}
+
+type QuickRingPage = 'tools' | 'colors'
+
+interface QuickRingAnchor {
+  position: [number, number, number]
+  quaternion: [number, number, number, number]
+  page: QuickRingPage
+  openedAt: number
+  preview: boolean
+}
+
 export interface DcPenProps {
   /** 設置位置 */
   position?: [number, number, number]
@@ -108,6 +144,12 @@ export interface DcPenProps {
   syncId?: string
   /** 通常線/RibbonBrushの比較UIを表示する。既定falseで0.1.xの体験を維持 */
   enableBrushControls?: boolean
+  /** トリガー2連打で、順送りの代わりにペン中心クイックリングを開く */
+  enableQuickRing?: boolean
+  /** ラックへ並べる物理ペン本数。1〜15、既定15。色リングは本数に関係なく15色 */
+  penCount?: number
+  /** ローカル画面確認専用。保持操作なしで1番ペンのリングを開く */
+  debugQuickRingPreview?: boolean | 'colors'
   defaultBrush?: BrushId
   defaultRibbonSize?: number
   /** ローカルユーザーが最後に選択/保持した物理ペン番号 */
@@ -245,23 +287,30 @@ const _penPos = new Vector3()
 const _viewOffset = new Vector3()
 const _lookM = new Matrix4()
 const _erasePt = new Vector3()
+const _ringPos = new Vector3()
+const _ringItemPos = new Vector3()
+const _ringQ = new Quaternion()
+const _ringLookM = new Matrix4()
 /** ラックに吊られた鉛筆の姿勢（ペン先下向き） */
 const HANG_Q = new Quaternion().setFromEuler(new Euler(-Math.PI / 2, 0, 0))
-
-const PEN_COUNT = PEN_COLORS.length
-const SLOT_COUNT = PEN_COUNT + ERASER_COLORS.length
 
 export const DcPen = ({
   position = [0, 0, 0],
   rotationY = 0,
   syncId = 'dcpen',
   enableBrushControls = false,
+  enableQuickRing = false,
+  penCount = PEN_COLORS.length,
+  debugQuickRingPreview = false,
   defaultBrush = DEFAULT_BRUSH,
   defaultRibbonSize = DEFAULT_RIBBON_SIZE,
   onSelectedPenChange,
   debugApi,
 }: DcPenProps) => {
   const SYNC_ID = syncId
+  const PEN_COUNT = normalizePenCount(penCount)
+  const SLOT_COUNT = PEN_COUNT + ERASER_COLORS.length
+  const rackInitialColors = initialRackColors(PEN_COUNT)
   const scene = useThree((s) => s.scene)
   const gl = useThree((s) => s.gl)
   const { localUser } = useUsers()
@@ -278,6 +327,7 @@ export const DcPen = ({
   const [selectedPenIndex, setSelectedPenIndex] = useState(0)
   const [visibilityMode, setVisibilityMode] = useState<VisibilityMode>('all')
   const [toolModeByPen, setToolModeByPen] = useState<Record<number, PenToolMode>>({})
+  const [quickRingRequest, setQuickRingRequest] = useState<QuickRingRequest | null>(null)
   const [pressureTelemetry, setPressureTelemetry] = useState<PressureTelemetry>({
     penIndex: 0, value: 0, min: 0, max: 0, source: 'speed', active: false,
   })
@@ -294,12 +344,23 @@ export const DcPen = ({
   })
   const selectedBrush = brushSettingsByPen.current[selectedPenIndex] ?? { id: initialBrush, size: initialSize }
   const selectedToolMode = toolModeByPen[selectedPenIndex] ?? selectedBrush.id
+  const [penColorsState, setPenColorsState] = useInstanceState<string[]>(
+    `${SYNC_ID}:pen-colors-v1`,
+    rackInitialColors,
+  )
+  const penColorsByPen = useRef<string[]>([])
+  penColorsByPen.current = Array.from({ length: PEN_COUNT }, (_, index) => {
+    const candidate = Array.isArray(penColorsState) ? penColorsState[index] : undefined
+    return typeof candidate === 'string' && (candidate === RAINBOW || /^#[0-9a-f]{6}$/i.test(candidate))
+      ? candidate
+      : (rackInitialColors[index] ?? '#111111')
+  })
 
   const selectPen = useCallback((penIndex: number) => {
     if (penIndex < 0 || penIndex >= PEN_COUNT) return
     setSelectedPenIndex(penIndex)
     onSelectedPenChange?.(penIndex)
-  }, [onSelectedPenChange])
+  }, [PEN_COUNT, onSelectedPenChange])
 
   const updateSelectedBrush = useCallback((update: Partial<BrushSettings>) => {
     const current = brushSettingsByPen.current
@@ -311,6 +372,13 @@ export const DcPen = ({
   const setPenToolMode = useCallback((penIndex: number, mode: PenToolMode) => {
     setToolModeByPen((modes) => ({ ...modes, [penIndex]: mode }))
   }, [])
+
+  const setPenColor = useCallback((penIndex: number, color: string) => {
+    if (penIndex < 0 || penIndex >= PEN_COUNT || !QUICK_RING_COLORS.includes(color)) return
+    const next = penColorsByPen.current.map((value, index) => index === penIndex ? color : value)
+    setPenColorsState(next)
+    selectPen(penIndex)
+  }, [selectPen, setPenColorsState])
 
   useEffect(() => onSelectedPenChange?.(0), [onSelectedPenChange])
 
@@ -458,14 +526,9 @@ export const DcPen = ({
   /** 「ぜんぶ片づける」用のputAwayだけを集めた軽量レジストリ（グリップ掴み自体はxrift-grab側が持つ） */
   const putAwayFns = useRef<((() => void) | null)[]>(new Array(SLOT_COUNT).fill(null))
 
-  const cycleHeldTool = useCallback((hand: Hand) => {
+  const applyHeldTool = useCallback((hand: Hand, next: PenToolMode) => {
     const penIndex = heldPenIndexByHand.current[hand]
     if (penIndex === null) return
-    const current: PenToolMode = eraserMode.current[hand]
-      ? 'eraser'
-      : (brushSettingsByPen.current[penIndex]?.id ?? DEFAULT_BRUSH)
-    const next = getNextPenToolMode(current)
-
     eraserMode.current[hand] = next === 'eraser'
     if (next !== 'eraser') {
       const settings = brushSettingsByPen.current
@@ -477,11 +540,39 @@ export const DcPen = ({
     selectPen(penIndex)
   }, [selectPen, setBrushSettingsState])
 
+  const cycleHeldTool = useCallback((hand: Hand) => {
+    const penIndex = heldPenIndexByHand.current[hand]
+    if (penIndex === null) return
+    const current: PenToolMode = eraserMode.current[hand]
+      ? 'eraser'
+      : (brushSettingsByPen.current[penIndex]?.id ?? DEFAULT_BRUSH)
+    applyHeldTool(hand, getNextPenToolMode(current))
+  }, [applyHeldTool])
+
+  const openHeldQuickRing = useCallback((hand: Hand) => {
+    const penIndex = heldPenIndexByHand.current[hand]
+    if (penIndex === null) return
+    setQuickRingRequest({ penIndex, hand, nonce: performance.now() })
+    selectPen(penIndex)
+  }, [selectPen])
+
+  useEffect(() => {
+    if (!enableQuickRing || !debugQuickRingPreview) return
+    setQuickRingRequest({
+      penIndex: 0,
+      hand: 'right',
+      nonce: performance.now(),
+      preview: true,
+      previewPage: debugQuickRingPreview === 'colors' ? 'colors' : 'tools',
+    })
+  }, [debugQuickRingPreview, enableQuickRing])
+
   useEffect(() => {
     const press = (hand: Hand, source: XRInputSource | null = null) => {
       const now = performance.now()
       if (anyHeldByHand.current[hand] && now - lastPressAt.current[hand] < DOUBLE_CLICK_MS) {
-        cycleHeldTool(hand)
+        if (enableQuickRing) openHeldQuickRing(hand)
+        else cycleHeldTool(hand)
         lastPressAt.current[hand] = 0
       } else {
         lastPressAt.current[hand] = now
@@ -546,7 +637,7 @@ export const DcPen = ({
       gl.xr.removeEventListener('sessionend', unbindSession)
       unbindSession()
     }
-  }, [cycleHeldTool, gl])
+  }, [cycleHeldTool, enableQuickRing, gl, openHeldQuickRing])
 
   const putAwayAll = useCallback(() => {
     for (const fn of putAwayFns.current) fn?.()
@@ -570,13 +661,13 @@ export const DcPen = ({
         <pointLight position={[0, 1.9, 0.3]} intensity={1.6} distance={5} color="#ffd49a" />
 
         {/* 色別ペン（吊り下げ・ペン先下向き） */}
-        {PEN_COLORS.map((c, i) => (
+        {penColorsByPen.current.map((c, i) => (
           <PenSlot
-            key={c}
+            key={`pen-${i}`}
             index={i}
             kind="pen"
             color={c}
-            colorName={COLOR_NAMES[i] ?? c}
+            colorName={getColorName(c)}
             slotOffset={[penX(i), 1.05, 0]}
             syncId={SYNC_ID}
             store={store}
@@ -594,6 +685,9 @@ export const DcPen = ({
             brushSettingsByPen={brushSettingsByPen}
             onSelectPen={selectPen}
             onToolModeChange={setPenToolMode}
+            onQuickToolSelect={applyHeldTool}
+            onColorChange={setPenColor}
+            quickRingRequest={enableQuickRing ? quickRingRequest : null}
             onPressureTelemetry={setPressureTelemetry}
           />
         ))}
@@ -623,21 +717,35 @@ export const DcPen = ({
             brushSettingsByPen={brushSettingsByPen}
             onSelectPen={selectPen}
             onToolModeChange={setPenToolMode}
+            onQuickToolSelect={applyHeldTool}
+            onColorChange={setPenColor}
+            quickRingRequest={null}
             onPressureTelemetry={setPressureTelemetry}
           />
         ))}
 
         {/* ペンごとのRespawn（上）とClear（下）＝QvPenのラックUI */}
-        {PEN_COLORS.map((c, i) => (
-          <group key={`ui-${c}`}>
+        {penColorsByPen.current.map((c, i) => (
+          <group key={`ui-pen-${i}`}>
+            <Text
+              position={[penX(i), 1.44, 0.025]}
+              fontSize={0.04}
+              color="#172033"
+              anchorX="center"
+              anchorY="middle"
+              outlineWidth={0.003}
+              outlineColor="#ffffff"
+            >
+              {`P${i + 1}`}
+            </Text>
             <LabeledButton
               id={`${SYNC_ID}-respawn-${i}`}
               position={[penX(i), 1.62, 0]}
               size={[0.09, 0.07, 0.02]}
               color="#37474f"
-              label="Respawn"
-              fontSize={0.015}
-              interactionText={`${COLOR_NAMES[i]}のペンを片づける`}
+              label="戻す"
+              fontSize={0.018}
+              interactionText={`P${i + 1}（${getColorName(c)}）を片づける`}
               onInteract={() => putAwayFns.current[i]?.()}
             >
               {/* 色バー（どのペンのボタンかを示す・QvPenの色帯） */}
@@ -655,9 +763,9 @@ export const DcPen = ({
               position={[penX(i), 0.62, 0]}
               size={[0.09, 0.07, 0.02]}
               color="#4a3b57"
-              label="Clear"
+              label="消す"
               fontSize={0.017}
-              interactionText={`${COLOR_NAMES[i]}のペンで自分が描いた線を消す`}
+              interactionText={`P${i + 1}で自分が描いた線を消す`}
               onInteract={() => { selectPen(i); clearPenMine(i) }}
             />
           </group>
@@ -812,6 +920,9 @@ interface PenSlotProps {
   brushSettingsByPen: MutableRefObject<BrushSettings[]>
   onSelectPen: (penIndex: number) => void
   onToolModeChange: (penIndex: number, mode: PenToolMode) => void
+  onQuickToolSelect: (hand: Hand, mode: PenToolMode) => void
+  onColorChange: (penIndex: number, color: string) => void
+  quickRingRequest: QuickRingRequest | null
   onPressureTelemetry: (telemetry: PressureTelemetry) => void
 }
 
@@ -838,6 +949,9 @@ const PenSlot = ({
   brushSettingsByPen,
   onSelectPen,
   onToolModeChange,
+  onQuickToolSelect,
+  onColorChange,
+  quickRingRequest,
   onPressureTelemetry,
 }: PenSlotProps) => {
   const SYNC_ID = syncId
@@ -877,6 +991,41 @@ const PenSlot = ({
   const pressAtTake = useRef(-1)
   /** ラック定位置の実ワールド姿勢を測る不可視アンカー（設置の位置・向きに追従） */
   const anchorRef = useRef<Group>(null)
+  const [quickRingAnchor, setQuickRingAnchor] = useState<QuickRingAnchor | null>(null)
+  const quickRingAnchorRef = useRef<QuickRingAnchor | null>(null)
+  quickRingAnchorRef.current = quickRingAnchor
+  const consumedQuickRingNonce = useRef<number | null>(null)
+  const quickRingItemRefs = useRef<(Group | null)[]>([])
+  const quickRingBackRef = useRef<Group>(null)
+  const [quickRingHover, setQuickRingHover] = useState<string | null>(null)
+  const quickRingHoverRef = useRef<string | null>(null)
+  const quickRingHoverSince = useRef(0)
+
+  const closeQuickRing = useCallback(() => {
+    quickRingAnchorRef.current = null
+    setQuickRingAnchor(null)
+    quickRingHoverRef.current = null
+    setQuickRingHover(null)
+    quickRingHoverSince.current = 0
+  }, [])
+
+  const openQuickRingAt = useCallback((position: Vector3, camera: Camera, preview: boolean, page: QuickRingPage = 'tools') => {
+    camera.getWorldPosition(_camPos)
+    _ringLookM.lookAt(_camPos, position, camera.up)
+    _ringQ.setFromRotationMatrix(_ringLookM)
+    const next: QuickRingAnchor = {
+      position: [position.x, position.y, position.z],
+      quaternion: [_ringQ.x, _ringQ.y, _ringQ.z, _ringQ.w],
+      page,
+      openedAt: performance.now(),
+      preview,
+    }
+    quickRingAnchorRef.current = next
+    setQuickRingAnchor(next)
+    quickRingHoverRef.current = null
+    setQuickRingHover(null)
+    quickRingHoverSince.current = 0
+  }, [])
 
   // 持ち主が去ったら定位置へ戻す（線は備品として残る＝書き置き）
   useInstanceEvent<unknown>('user-left', (d) => {
@@ -967,10 +1116,11 @@ const PenSlot = ({
     anyHeldByHand.current[hd] = false
     eraserMode.current[hd] = false
     heldPenIndexByHand.current[hd] = null
+    closeQuickRing()
     if (kind === 'pen') {
       onToolModeChange(index, brushSettingsByPen.current[index]?.id ?? DEFAULT_BRUSH)
     }
-  }, [anyHeldByHand, brushSettingsByPen, eraserMode, heldPenIndexByHand, index, kind, onToolModeChange])
+  }, [anyHeldByHand, brushSettingsByPen, closeQuickRing, eraserMode, heldPenIndexByHand, index, kind, onToolModeChange])
 
   const grab = useGrabbable({
     id: `${SYNC_ID}-slot-${index}`,
@@ -1104,6 +1254,18 @@ const PenSlot = ({
     const held = heldRef.current
     const h = holderRef.current
 
+    const pendingRing = quickRingRequest?.penIndex === index ? quickRingRequest : null
+    if (
+      pendingRing?.preview &&
+      consumedQuickRingNonce.current !== pendingRing.nonce
+    ) {
+      consumedQuickRingNonce.current = pendingRing.nonce
+      camera.getWorldPosition(_camPos)
+      camera.getWorldDirection(_dir)
+      _ringPos.copy(_camPos).addScaledVector(_dir, 1.35)
+      openQuickRingAt(_ringPos, camera, true, pendingRing.previewPage ?? 'tools')
+    }
+
     if (h === null) {
       if (held) held.visible = false
       if (activeRef.current) endActiveStroke()
@@ -1171,6 +1333,85 @@ const PenSlot = ({
     if (held) {
       held.visible = hasPose
       if (hasPose) held.position.copy(_penPos)
+    }
+
+    if (
+      pendingRing &&
+      !pendingRing.preview &&
+      pendingRing.hand === h.hand &&
+      h.id === myIdRef.current &&
+      hasPose &&
+      consumedQuickRingNonce.current !== pendingRing.nonce
+    ) {
+      consumedQuickRingNonce.current = pendingRing.nonce
+      endActiveStroke()
+      pressAnchorValid.current = false
+      pressAtTake.current = drawInput.current[h.hand].seq
+      if (quickRingAnchorRef.current) closeQuickRing()
+      else openQuickRingAt(tip.current, camera, false)
+    }
+
+    const ring = quickRingAnchorRef.current
+    if (ring && !ring.preview && h.id === myIdRef.current && hasPose) {
+      const now = performance.now()
+      if (now - ring.openedAt >= QUICK_RING_TIMEOUT_MS) {
+        closeQuickRing()
+        return
+      }
+
+      let hoverKey: string | null = null
+      let hoverIndex: number | null = null
+      let nearestDistance = QUICK_RING_HIT_RADIUS
+      const itemCount = ring.page === 'tools' ? QUICK_RING_TOOL_ITEMS.length : QUICK_RING_COLORS.length
+      for (let itemIndex = 0; itemIndex < itemCount; itemIndex += 1) {
+        const item = quickRingItemRefs.current[itemIndex]
+        if (!item) continue
+        item.getWorldPosition(_ringItemPos)
+        const distance = _ringItemPos.distanceTo(tip.current)
+        if (distance <= nearestDistance) {
+          nearestDistance = distance
+          hoverIndex = itemIndex
+          hoverKey = `${ring.page}:${itemIndex}`
+        }
+      }
+      if (ring.page === 'colors' && quickRingBackRef.current) {
+        quickRingBackRef.current.getWorldPosition(_ringItemPos)
+        const distance = _ringItemPos.distanceTo(tip.current)
+        if (distance <= nearestDistance) {
+          hoverIndex = -1
+          hoverKey = 'colors:back'
+        }
+      }
+
+      if (hoverKey !== quickRingHoverRef.current) {
+        quickRingHoverRef.current = hoverKey
+        setQuickRingHover(hoverKey)
+        quickRingHoverSince.current = now
+      } else if (hoverKey !== null && now - quickRingHoverSince.current >= QUICK_RING_DWELL_MS) {
+        if (ring.page === 'colors' && hoverIndex === -1) {
+          const next = { ...ring, page: 'tools' as const, openedAt: now }
+          quickRingAnchorRef.current = next
+          setQuickRingAnchor(next)
+        } else if (ring.page === 'tools' && hoverIndex !== null) {
+          const item = QUICK_RING_TOOL_ITEMS[hoverIndex]
+          if (item?.kind === 'colors') {
+            const next = { ...ring, page: 'colors' as const, openedAt: now }
+            quickRingAnchorRef.current = next
+            setQuickRingAnchor(next)
+          } else if (item?.kind === 'tool') {
+            onQuickToolSelect(h.hand, item.mode)
+            closeQuickRing()
+          }
+        } else if (ring.page === 'colors' && hoverIndex !== null) {
+          const nextColor = QUICK_RING_COLORS[hoverIndex]
+          if (nextColor) onColorChange(index, nextColor)
+          closeQuickRing()
+        }
+        quickRingHoverRef.current = null
+        setQuickRingHover(null)
+        quickRingHoverSince.current = now
+      }
+      return
     }
     // 消しゴムモードの表示（ペン先が球になる・QvPen準拠。手ごとに独立）
     const inEraserMode = kind === 'pen' && eraserMode.current[h.hand]
@@ -1307,7 +1548,7 @@ const PenSlot = ({
 
   const inAir = pose !== null
   const onRack = holder === null && !inAir
-  const noun = kind === 'pen' ? `${colorName}のペン` : colorName
+  const noun = kind === 'pen' ? `P${index + 1}（${colorName}）` : colorName
   const rackText =
     holder === null
       ? inAir
@@ -1333,6 +1574,22 @@ const PenSlot = ({
     }
   }, [grab, returnToRack, putAway, index, kind, onSelectPen])
 
+  const ringHand = holder?.hand ?? myHeldHandRef.current ?? 'right'
+  const quickRingToolMode: PenToolMode = eraserMode.current[ringHand]
+    ? 'eraser'
+    : (brushSettingsByPen.current[index]?.id ?? DEFAULT_BRUSH)
+  const quickRingHoverLabel = (() => {
+    if (!quickRingHover) return quickRingAnchor?.page === 'colors' ? '色を選ぶ' : '道具を選ぶ'
+    if (quickRingHover === 'colors:back') return '戻る'
+    const itemIndex = Number(quickRingHover.split(':')[1])
+    if (!Number.isInteger(itemIndex)) return ''
+    if (quickRingAnchor?.page === 'colors') {
+      const hoveredColor = QUICK_RING_COLORS[itemIndex]
+      return hoveredColor ? getColorName(hoveredColor) : ''
+    }
+    return QUICK_RING_TOOL_ITEMS[itemIndex]?.label ?? ''
+  })()
+
   return (
     <group position={slotOffset}>
       {/* 定位置のワールド姿勢を測るアンカー（描画なし） */}
@@ -1346,7 +1603,7 @@ const PenSlot = ({
         {/* ラック上の実体（誰も持っておらず空中にも無いときだけ見える） */}
         {kind === 'pen' ? (
           <group rotation={[-Math.PI / 2, 0, 0]} visible={onRack}>
-            <PencilMesh color={color} />
+            <PencilMesh color={color} penLabel={`P${index + 1}`} />
           </group>
         ) : (
           <group visible={onRack}>
@@ -1376,7 +1633,7 @@ const PenSlot = ({
               }}
               interactionText={`${noun}を持つ`}
             >
-              {kind === 'pen' ? <PencilMesh color={color} /> : <EraserMesh color={color} />}
+              {kind === 'pen' ? <PencilMesh color={color} penLabel={`P${index + 1}`} /> : <EraserMesh color={color} />}
               <mesh position={[0, 0, kind === 'pen' ? 0.17 : 0]}>
                 <sphereGeometry args={[0.08, 8, 8]} />
                 <meshBasicMaterial transparent opacity={0} depthWrite={false} />
@@ -1389,7 +1646,7 @@ const PenSlot = ({
       {/* 手元の実体はワールド座標なのでシーン直下に描く */}
       {createPortal(
         <group ref={heldRef} visible={false} name={`${SYNC_ID}-held-${index}`}>
-          {kind === 'pen' ? <PencilMesh color={color} /> : <EraserMesh color={color} />}
+          {kind === 'pen' ? <PencilMesh color={color} penLabel={`P${index + 1}`} /> : <EraserMesh color={color} />}
           {/* 消しゴムモード時にペン先が球になる（QvPen準拠の表示） */}
           {kind === 'pen' && (
             <mesh ref={eraserTipRef} visible={false} position={[0, 0, 0.005]}>
@@ -1400,6 +1657,129 @@ const PenSlot = ({
         </group>,
         scene,
       )}
+
+      {quickRingAnchor && kind === 'pen' &&
+        createPortal(
+          <group
+            position={quickRingAnchor.position}
+            quaternion={quickRingAnchor.quaternion}
+            name={`${SYNC_ID}-quick-ring-${index}`}
+          >
+            <mesh position={[0, 0, -0.008]}>
+              <circleGeometry args={[0.292, 48]} />
+              <meshBasicMaterial color="#172033" transparent opacity={0.88} side={DoubleSide} depthTest={false} />
+            </mesh>
+            <mesh position={[0, 0, -0.006]}>
+              <ringGeometry args={[0.272, 0.288, 48]} />
+              <meshBasicMaterial color={color === RAINBOW ? '#f8fafc' : color} side={DoubleSide} depthTest={false} />
+            </mesh>
+
+            {quickRingAnchor.page === 'tools' ? QUICK_RING_TOOL_ITEMS.map((item, itemIndex) => {
+              const hoverKey = `tools:${itemIndex}`
+              const selected = item.kind === 'tool' && item.mode === quickRingToolMode
+              const hovered = quickRingHover === hoverKey
+              return (
+                <group
+                  key={item.id}
+                  ref={(node) => { quickRingItemRefs.current[itemIndex] = node }}
+                  position={radialPosition(itemIndex, QUICK_RING_TOOL_ITEMS.length, QUICK_RING_TOOL_RADIUS)}
+                  scale={hovered ? 1.18 : 1}
+                >
+                  <mesh>
+                    <circleGeometry args={[0.052, 28]} />
+                    <meshBasicMaterial color={item.color} side={DoubleSide} depthTest={false} />
+                  </mesh>
+                  {(selected || hovered) && (
+                    <mesh position={[0, 0, 0.003]}>
+                      <ringGeometry args={[0.057, 0.065, 28]} />
+                      <meshBasicMaterial color={hovered ? '#facc15' : '#ffffff'} side={DoubleSide} depthTest={false} />
+                    </mesh>
+                  )}
+                  <Text
+                    position={[0, 0, 0.006]}
+                    fontSize={item.id === 'ribbon' ? 0.019 : 0.025}
+                    color={item.id === 'colors' ? '#172033' : '#ffffff'}
+                    anchorX="center"
+                    anchorY="middle"
+                    outlineWidth={0.0015}
+                    outlineColor={item.id === 'colors' ? '#ffffff' : '#000000'}
+                  >
+                    {item.label}
+                  </Text>
+                </group>
+              )
+            }) : (
+              <>
+                {QUICK_RING_COLORS.map((swatchColor, itemIndex) => {
+                  const hoverKey = `colors:${itemIndex}`
+                  const selected = swatchColor === color
+                  const hovered = quickRingHover === hoverKey
+                  return (
+                    <group
+                      key={`${swatchColor}-${itemIndex}`}
+                      ref={(node) => { quickRingItemRefs.current[itemIndex] = node }}
+                      position={radialPosition(itemIndex, QUICK_RING_COLORS.length, QUICK_RING_COLOR_RADIUS)}
+                      scale={hovered ? 1.2 : 1}
+                    >
+                      <mesh>
+                        <circleGeometry args={[0.035, 24]} />
+                        <meshBasicMaterial
+                          color={swatchColor === RAINBOW ? '#ffffff' : swatchColor}
+                          side={DoubleSide}
+                          depthTest={false}
+                        />
+                      </mesh>
+                      <mesh position={[0, 0, 0.003]}>
+                        <ringGeometry args={[0.039, 0.045, 24]} />
+                        <meshBasicMaterial
+                          color={hovered ? '#facc15' : selected ? '#ffffff' : '#64748b'}
+                          side={DoubleSide}
+                          depthTest={false}
+                        />
+                      </mesh>
+                      {swatchColor === RAINBOW && (
+                        <Text position={[0, 0, 0.006]} fontSize={0.018} color="#172033" anchorX="center" anchorY="middle">
+                          虹
+                        </Text>
+                      )}
+                    </group>
+                  )
+                })}
+                <group ref={quickRingBackRef}>
+                  <mesh>
+                    <circleGeometry args={[0.046, 24]} />
+                    <meshBasicMaterial color="#475569" side={DoubleSide} depthTest={false} />
+                  </mesh>
+                  <Text position={[0, 0, 0.006]} fontSize={0.021} color="#ffffff" anchorX="center" anchorY="middle">
+                    戻る
+                  </Text>
+                </group>
+              </>
+            )}
+
+            <Text
+              position={[0, -0.338, 0.008]}
+              fontSize={0.032}
+              color="#ffffff"
+              anchorX="center"
+              anchorY="middle"
+              outlineWidth={0.002}
+              outlineColor="#000000"
+            >
+              {quickRingHoverLabel}
+            </Text>
+            <Text
+              position={[0, 0.263, 0.008]}
+              fontSize={0.018}
+              color="#cbd5e1"
+              anchorX="center"
+              anchorY="middle"
+            >
+              ペン先を近づけて選択
+            </Text>
+          </group>,
+          scene,
+        )}
     </group>
   )
 }
@@ -1411,7 +1791,7 @@ const RAINBOW_STRIPES = ['#e53935', '#fb8c00', '#fdd835', '#43a047', '#1e88e5', 
  * 鉛筆の造形（QvPenの見た目準拠）。原点がペン先、+Z方向へ軸が伸びる。
  * ラック表示時は rotation.x=-90° で吊るす（ペン先下向き）
  */
-const PencilMesh = ({ color }: { color: string }) => {
+const PencilMesh = ({ color, penLabel }: { color: string; penLabel: string }) => {
   const lead = color === RAINBOW ? '#ffffff' : color
   return (
     <group>
@@ -1439,6 +1819,35 @@ const PencilMesh = ({ color }: { color: string }) => {
           <meshStandardMaterial color={color} roughness={0.6} />
         </mesh>
       )}
+      {/* 色を変えても失われない物理ペンID。軸の両面に表示して受け渡し時も判別する。 */}
+      <mesh position={[0, 0.0135, 0.286]}>
+        <boxGeometry args={[0.031, 0.003, 0.054]} />
+        <meshStandardMaterial color="#ffffff" roughness={0.7} />
+      </mesh>
+      <Text
+        position={[0, 0.0155, 0.286]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        fontSize={penLabel.length > 2 ? 0.013 : 0.016}
+        color="#172033"
+        anchorX="center"
+        anchorY="middle"
+      >
+        {penLabel}
+      </Text>
+      <mesh position={[0, -0.0135, 0.286]}>
+        <boxGeometry args={[0.031, 0.003, 0.054]} />
+        <meshStandardMaterial color="#ffffff" roughness={0.7} />
+      </mesh>
+      <Text
+        position={[0, -0.0155, 0.286]}
+        rotation={[Math.PI / 2, 0, 0]}
+        fontSize={penLabel.length > 2 ? 0.013 : 0.016}
+        color="#172033"
+        anchorX="center"
+        anchorY="middle"
+      >
+        {penLabel}
+      </Text>
     </group>
   )
 }
@@ -1488,7 +1897,7 @@ const LabeledButton = ({
         anchorX="center"
         anchorY="middle"
         outlineWidth={fontSize * 0.08}
-        outlineColor="#00000088"
+        outlineColor="#000000"
       >
         {label}
       </Text>

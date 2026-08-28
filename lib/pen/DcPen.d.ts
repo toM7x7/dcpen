@@ -17,6 +17,12 @@ export interface DcPenProps {
     syncId?: string;
     /** 通常線/RibbonBrushの比較UIを表示する。既定falseで0.1.xの体験を維持 */
     enableBrushControls?: boolean;
+    /** トリガー2連打で、順送りの代わりにペン中心クイックリングを開く */
+    enableQuickRing?: boolean;
+    /** ラックへ並べる物理ペン本数。1〜15、既定15。色リングは本数に関係なく15色 */
+    penCount?: number;
+    /** ローカル画面確認専用。保持操作なしで1番ペンのリングを開く */
+    debugQuickRingPreview?: boolean | 'colors';
     defaultBrush?: BrushId;
     defaultRibbonSize?: number;
     /** ローカルユーザーが最後に選択/保持した物理ペン番号 */
@@ -31,5 +37,5 @@ export interface PressureSample {
 }
 export declare function resolvePressureSample(source: XRInputSource | null, distance: number, deltaSeconds: number): PressureSample;
 export declare function resolvePressure(source: XRInputSource | null, distance: number, deltaSeconds: number): number;
-export declare const DcPen: ({ position, rotationY, syncId, enableBrushControls, defaultBrush, defaultRibbonSize, onSelectedPenChange, debugApi, }: DcPenProps) => import("react/jsx-runtime").JSX.Element;
+export declare const DcPen: ({ position, rotationY, syncId, enableBrushControls, enableQuickRing, penCount, debugQuickRingPreview, defaultBrush, defaultRibbonSize, onSelectedPenChange, debugApi, }: DcPenProps) => import("react/jsx-runtime").JSX.Element;
 //# sourceMappingURL=DcPen.d.ts.map
